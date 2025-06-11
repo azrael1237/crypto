@@ -1,3 +1,5 @@
+# Developed by Alfi Keita
+
 import os
 import sys
 import copy
