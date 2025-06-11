@@ -1,4 +1,5 @@
 # Developed by Alfi Keita
+# end-to-end encryption protocol
 
 import os
 import sys
