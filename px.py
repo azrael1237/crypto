@@ -778,3 +778,32 @@ class DH2048:
     def get_group_params(cls):
         return cls._p, cls._g
 
+import hashlib
+import struct
+
+def xor_bytes(a, b):
+    """XOR two byte strings."""
+    return bytes(x ^ y for x, y in zip(a, b))
+
+def hmac_sha256(key: bytes, message: bytes) -> bytes:
+    block_size = 64  # Block size for SHA-256
+
+    # Step 1: Keys longer than block size are shortened by hashing them
+    if len(key) > block_size:
+        key = hashlib.sha256(key).digest()
+
+    # Step 2: Keys shorter than block size are padded to block size by padding with zeros on the right
+    if len(key) < block_size:
+        key = key + b'\x00' * (block_size - len(key))
+
+    # Step 3: Create inner and outer padded keys
+    o_key_pad = xor_bytes(key, b'\x5c' * block_size)
+    i_key_pad = xor_bytes(key, b'\x36' * block_size)
+
+    # Step 4: HMAC construction
+    inner_hash = hashlib.sha256(i_key_pad + message).digest()
+    hmac_digest = hashlib.sha256(o_key_pad + inner_hash).digest()
+    return hmac_digest
+
+def hmac_sha256_hex(key: bytes, message: bytes) -> str:
+    return hmac_sha256(key, message).hex()
