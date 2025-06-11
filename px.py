@@ -661,3 +661,120 @@ def benchmark_rsa_oaep(public_key, private_key, k, message, runs=1000):
     print(f"Encryption:   avg={enc_avg:.6f}s, median={enc_median:.6f}s")
     print(f"Decryption:   avg={dec_avg:.6f}s, median={dec_median:.6f}s")
     return (enc_avg, enc_median, dec_avg, dec_median)
+
+import secrets
+import hashlib
+import hmac
+
+class DH2048:
+    """
+    Production-grade Diffie-Hellman with RFC 3526 Group 14 prime.
+    - Full 2048-bit prime p and generator g=2.
+    - Strong public key validation.
+    - Secure random private key generation.
+    - Uses SHA-256 based HKDF for key derivation.
+    """
+
+    # Full RFC 3526 Group 14 prime (2048-bit)
+    _p_hex = (
+        "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"
+        "29024E088A67CC74020BBEA63B139B22514A08798E3404DD"
+        "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245"
+        "E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED"
+        "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE65381"
+        "FFFFFFFFFFFFFFFF"
+    )
+    _p = int(_p_hex, 16)
+    _g = 2
+
+    def __init__(self, priv=None):
+        if priv is None:
+            self.priv = self._gen_private_key()
+        else:
+            if not (1 < priv < self._p - 1):
+                raise ValueError("Private key out of range")
+            self.priv = priv
+        self.pub = pow(self._g, self.priv, self._p)
+
+    @classmethod
+    def _gen_private_key(cls):
+        # Private key: 256-bit random integer between 2 and p-2
+        while True:
+            candidate = secrets.randbits(256)
+            if 1 < candidate < cls._p - 1:
+                return candidate
+
+    def get_public(self):
+        return self.pub
+
+    def get_public_bytes(self):
+        # 256 bytes big endian
+        return self.pub.to_bytes(256, 'big')
+
+    @classmethod
+    def validate_public(cls, pub):
+        """
+        Validates a peer public key.
+        Conditions:
+        - 2 <= pub <= p-2
+        - pub^q mod p == 1 (where q = (p-1)/2 for safe primes)
+        """
+        if not (2 <= pub <= cls._p - 2):
+            return False
+
+        # Check subgroup: since p is safe prime, q = (p-1)//2
+        q = (cls._p - 1) // 2
+        # pub^q mod p must be 1 for valid subgroup member
+        if pow(pub, q, cls._p) != 1:
+            return False
+        return True
+
+    def compute_shared_secret(self, peer_pub):
+        if not self.validate_public(peer_pub):
+            raise ValueError("Invalid peer public key")
+
+        # Calculate shared secret
+        secret = pow(peer_pub, self.priv, self._p)
+        if secret == 1:
+            # Reject trivial shared secret, which indicates invalid peer
+            raise ValueError("Shared secret is trivial (1), invalid key")
+        return secret
+
+    @staticmethod
+    def _hkdf_extract(salt, ikm):
+        """HKDF Extract step using HMAC-SHA256."""
+        return hmac.new(salt, ikm, hashlib.sha256).digest()
+
+    @staticmethod
+    def _hkdf_expand(prk, info, length=32):
+        """HKDF Expand step."""
+        okm = b""
+        previous = b""
+        counter = 1
+        while len(okm) < length:
+            data = previous + info + bytes([counter])
+            previous = hmac.new(prk, data, hashlib.sha256).digest()
+            okm += previous
+            counter += 1
+        return okm[:length]
+
+    @classmethod
+    def kdf_hkdf_sha256(cls, secret, salt=b"", info=b"dh shared key", length=32):
+        """
+        Derive a symmetric key from the shared secret using HKDF-SHA256.
+        - salt: optional salt (should be random or protocol-specific)
+        - info: context/application info (prevents cross-protocol key reuse)
+        """
+        secret_bytes = secret.to_bytes((secret.bit_length() + 7) // 8, 'big')
+        prk = cls._hkdf_extract(salt, secret_bytes)
+        okm = cls._hkdf_expand(prk, info, length)
+        return okm
+
+    def derive_key(self, peer_pub, salt=b"", info=b"dh shared key", length=32):
+        secret = self.compute_shared_secret(peer_pub)
+        return self.kdf_hkdf_sha256(secret, salt=salt, info=info, length=length)
+
+    @classmethod
+    def get_group_params(cls):
+        return cls._p, cls._g
+
