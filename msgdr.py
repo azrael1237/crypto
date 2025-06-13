@@ -1,5 +1,3 @@
-# Created By Alfi Keita
-
 from __future__ import absolute_import
 
 import os
@@ -168,21 +166,6 @@ class RatchetIface(ABC):
     @staticmethod
     @abstractmethod
     def decrypt_message(state, msg, associated_data, aead, keypair):
-        pass
-
-# --- interfaces/x3dh.py ---
-
-class X3DH_Iface(ABC):
-    """X3DH Key Agreement Interface"""
-
-    @staticmethod
-    @abstractmethod
-    def sender_calculate_shared_secret(sender_id_priv, sender_eph_priv, recipient_id_pub, recipient_pre_pub, recipient_one_time_pub=None):
-        pass
-
-    @staticmethod
-    @abstractmethod
-    def receiver_calculate_shared_secret(recipient_id_priv, recipient_pre_priv, recipient_one_time_priv, sender_id_pub, sender_eph_pub):
         pass
 
 # --- crypto/utils.py (needed by aead) ---
@@ -1078,67 +1061,6 @@ def dh_ratchet(state, dh_pk_r, keypair):
     state.receive.msg_no = 0
     state.skipped_count = 0
 
-# --- x3dh.py ---
-
-class X3DH(X3DH_Iface):
-    """
-    Implements the X3DH key agreement using X448 keys and HKDF-SHA256.
-    """
-    @staticmethod
-    def sender_calculate_shared_secret(sender_id_priv, sender_eph_priv, recipient_id_pub, recipient_pre_pub, recipient_one_time_pub=None):
-        # DH1: DH(sender_id_priv, recipient_pre_pub)
-        dh1 = sender_id_priv.dh_out(recipient_pre_pub)
-        # DH2: DH(sender_eph_priv, recipient_id_pub)
-        dh2 = sender_eph_priv.dh_out(recipient_id_pub)
-        # DH3: DH(sender_eph_priv, recipient_pre_pub)
-        dh3 = sender_eph_priv.dh_out(recipient_pre_pub)
-        # DH4: DH(sender_eph_priv, recipient_one_time_pub) (optional)
-        dh4 = sender_eph_priv.dh_out(recipient_one_time_pub) if recipient_one_time_pub else b""
-
-        kdf_input = dh1 + dh2 + dh3 + dh4
-        # Derive shared secret
-        shared_secret = hkdf(
-            kdf_input,
-            32,
-            None,
-            b"x3dh_shared_secret",
-            SHA256(),
-            default_backend()
-        )
-        return shared_secret
-
-    @staticmethod
-    def receiver_calculate_shared_secret(recipient_id_priv, recipient_pre_priv, recipient_one_time_priv, sender_id_pub, sender_eph_pub):
-        # DH1: DH(recipient_pre_priv, sender_id_pub)
-        dh1 = recipient_pre_priv.dh_out(sender_id_pub)
-        # DH2: DH(recipient_id_priv, sender_eph_pub)
-        dh2 = recipient_id_priv.dh_out(sender_eph_pub)
-        # DH3: DH(recipient_pre_priv, sender_eph_pub)
-        dh3 = recipient_pre_priv.dh_out(sender_eph_pub)
-        # DH4: DH(recipient_one_time_priv, sender_eph_pub) (optional)
-        dh4 = recipient_one_time_priv.dh_out(sender_eph_pub) if recipient_one_time_priv else b""
-
-        kdf_input = dh1 + dh2 + dh3 + dh4
-        # Derive shared secret
-        shared_secret = hkdf(
-            kdf_input,
-            32,
-            None,
-            b"x3dh_shared_secret",
-            SHA256(),
-            default_backend()
-        )
-        return shared_secret
-
-class X3DHKeyBundle:
-    """
-    Represents a recipient's X3DH key bundle for distribution.
-    """
-    def __init__(self, id_pub, pre_pub, one_time_pub=None):
-        self.id_pub = id_pub
-        self.pre_pub = pre_pub
-        self.one_time_pub = one_time_pub
-
 # --- session.py ---
 
 class DRSession(SerializableIface):
@@ -1191,33 +1113,6 @@ class DRSession(SerializableIface):
             raise TypeError("sk must be of type: bytes")
         if not isinstance(dh_pair, DHKeyPair):
             raise TypeError("dh_pair must be of type: DHKeyPair")
-        self._state.init_receiver(sk, dh_pair)
-
-    def setup_sender_x3dh(self, sender_id_priv, sender_eph_priv, recipient_id_pub, recipient_pre_pub, recipient_one_time_pub=None):
-        """
-        Uses X3DH to compute the shared secret and initialize the sender session.
-        """
-        sk = X3DH.sender_calculate_shared_secret(
-            sender_id_priv,
-            sender_eph_priv,
-            recipient_id_pub,
-            recipient_pre_pub,
-            recipient_one_time_pub
-        )
-        self._state.init_sender(sk, recipient_pre_pub)
-
-    def setup_receiver_x3dh(self, recipient_id_priv, recipient_pre_priv, recipient_one_time_priv, sender_id_pub, sender_eph_pub):
-        """
-        Uses X3DH to compute the shared secret and initialize the receiver session.
-        """
-        sk = X3DH.receiver_calculate_shared_secret(
-            recipient_id_priv,
-            recipient_pre_priv,
-            recipient_one_time_priv,
-            sender_id_pub,
-            sender_eph_pub
-        )
-        dh_pair = self._keypair(recipient_pre_priv.private_key)
         self._state.init_receiver(sk, dh_pair)
 
     def encrypt_message(self, pt: str, associated_data: bytes) -> Message:
