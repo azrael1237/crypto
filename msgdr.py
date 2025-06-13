@@ -8,24 +8,18 @@ from abc import ABC, abstractmethod
 # --- interfaces/serializable.py ---
 
 class SerializableIface(ABC):
-    """Serializable Interface"""
-
     @abstractmethod
     def serialize(self):
-        """Returns serialized dict of class state."""
         pass
 
     @classmethod
     @abstractmethod
     def deserialize(cls, serialized_obj):
-        """Class instance from serialized class state."""
         pass
 
 # --- interfaces/aead.py ---
 
 class AEADIFace(ABC):
-    """Authenticated Encryption with Associated Data Interface"""
-
     @staticmethod
     @abstractmethod
     def encrypt(key, pt, associated_data = None):
@@ -39,8 +33,6 @@ class AEADIFace(ABC):
 # --- interfaces/dhkey.py ---
 
 class DHKeyPairIface(SerializableIface):
-    """Diffie-Hellman Keypair"""
-
     @classmethod
     @abstractmethod
     def generate_dh(cls):
@@ -61,8 +53,6 @@ class DHKeyPairIface(SerializableIface):
         pass
 
 class DHPublicKeyIface(SerializableIface):
-    """Diffie-Hellman Public Key"""
-
     @abstractmethod
     def pk_bytes(self):
         pass
@@ -84,8 +74,6 @@ class DHPublicKeyIface(SerializableIface):
 # --- interfaces/kdfchain.py ---
 
 class KDFChainIface(SerializableIface):
-    """KDF Chain Interface."""
-
     @property
     @abstractmethod
     def ck(self):
@@ -97,8 +85,6 @@ class KDFChainIface(SerializableIface):
         pass
 
 class SymmetricChainIface(KDFChainIface):
-    """Symmetric KDF Chain Interface (extends KDFChain Interface)."""
-
     @abstractmethod
     def ratchet(self):
         pass
@@ -114,8 +100,6 @@ class SymmetricChainIface(KDFChainIface):
         pass
 
 class RootChainIface(KDFChainIface):
-    """Root KDF Chain Interface (extends KDFChain Interface)."""
-
     @abstractmethod
     def ratchet(self, dh_out):
         pass
@@ -123,8 +107,6 @@ class RootChainIface(KDFChainIface):
 # --- interfaces/keystorage.py ---
 
 class MsgKeyStorageIface(SerializableIface):
-    """Dictionary-like Message Key Storage Interface"""
-
     @abstractmethod
     def front(self):
         pass
@@ -156,8 +138,6 @@ class MsgKeyStorageIface(SerializableIface):
 # --- interfaces/ratchet.py ---
 
 class RatchetIface(ABC):
-    """Double Ratchet Algorithm Communication Interface"""
-
     @staticmethod
     @abstractmethod
     def encrypt_message(state, pt, associated_data, aead):
@@ -197,103 +177,15 @@ def hmac_verify(key, data, algorithm, backend, tag):
 
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.hashes import SHA256
-from cryptography.hazmat.primitives import padding
 from cryptography.exceptions import InvalidSignature
 
 class AuthenticationFailed(Exception):
-    """Decrypting ciphertext with authenticated data failed."""
     pass
 
-class AES256CBCHMAC(AEADIFace):
-    """An implementation of the AEAD Interface."""
-
-    KEY_LEN = 32 # 256-bit key
-    IV_LEN = 16
-    HKDF_LEN = 2 * KEY_LEN + IV_LEN
-    TAG_LEN = 32
-
-    @staticmethod
-    def encrypt(key, pt, associated_data = None):
-        if not isinstance(key, bytes):
-            raise TypeError("key must be of type: bytes")
-        if not len(key) == AES256GCM.KEY_LEN:
-            raise ValueError("key must be 32 bytes")
-        if not isinstance(pt, bytes):
-            raise TypeError("pt must be of type: bytes")
-        if associated_data and not isinstance(associated_data, bytes):
-            raise TypeError("associated_data must be of type: bytes")
-
-        aes_key, hmac_key, iv = AES256CBCHMAC._gen_keys(key)
-
-        padder = padding.PKCS7(AES256CBCHMAC.IV_LEN * 8).padder()
-        padded_pt = padder.update(pt) + padder.finalize()
-
-        aes_cbc = AES256CBCHMAC._aes_cipher(aes_key, iv).encryptor()
-        ct = aes_cbc.update(padded_pt) + aes_cbc.finalize()
-
-        tag = hmac(hmac_key, (associated_data or b"") + ct, SHA256(), default_backend())
-        return ct + tag
-
-    @staticmethod
-    def decrypt(key, ct, associated_data = None):
-        if not isinstance(key, bytes):
-            raise TypeError("key must be of type: bytes")
-        if not len(key) == AES256GCM.KEY_LEN:
-            raise ValueError("key must be 32 bytes")
-        if not isinstance(ct, bytes):
-            raise TypeError("ct must be of type: bytes")
-        if associated_data and not isinstance(associated_data, bytes):
-            raise TypeError("associated_data must be of type: bytes")
-
-        aes_key, hmac_key, iv = AES256CBCHMAC._gen_keys(key)
-
-        try:
-            hmac_verify(hmac_key,
-                (associated_data or b"") + ct[:-SHA256().digest_size],
-                SHA256(),
-                default_backend(),
-                ct[-SHA256().digest_size:] # tag
-            )
-        except InvalidSignature:
-            raise AuthenticationFailed("Invalid ciphertext")
-
-        aes_cbc = AES256CBCHMAC._aes_cipher(aes_key, iv).decryptor()
-        pt_padded = aes_cbc.update(ct[:-SHA256().digest_size]) + aes_cbc.finalize()
-
-        unpadder = padding.PKCS7(AES256CBCHMAC.IV_LEN * 8).unpadder()
-        pt = unpadder.update(pt_padded) + unpadder.finalize()
-
-        return pt
-
-    @staticmethod
-    def _gen_keys(key):
-        hkdf_out = hkdf(
-            key,
-            AES256CBCHMAC.HKDF_LEN,
-            bytes(SHA256().digest_size),
-            b"cbchmac_keys",
-            SHA256(),
-            default_backend()
-        )
-
-        return hkdf_out[:AES256CBCHMAC.KEY_LEN], \
-            hkdf_out[AES256CBCHMAC.KEY_LEN:2*AES256CBCHMAC.KEY_LEN], \
-            hkdf_out[-AES256CBCHMAC.IV_LEN:]
-
-    @staticmethod
-    def _aes_cipher(aes_key, iv):
-        return Cipher(
-            algorithms.AES(aes_key),
-            modes.CBC(iv),
-            backend = default_backend()
-        )
-
 class AES256GCM(AEADIFace):
-    """An implementation of the AEAD Interface."""
-    KEY_LEN = 32 # 256-bit key
-    IV_LEN = 16
+    KEY_LEN = 32
+    IV_LEN = 12  # Standard for GCM
 
     @staticmethod
     def encrypt(key, pt, associated_data = None):
@@ -309,7 +201,6 @@ class AES256GCM(AEADIFace):
         aesgcm = AESGCM(key)
         iv = os.urandom(AES256GCM.IV_LEN)
         ct = aesgcm.encrypt(iv, pt, associated_data)
-
         return ct + iv
 
     @staticmethod
@@ -323,57 +214,122 @@ class AES256GCM(AEADIFace):
         if associated_data and not isinstance(associated_data, bytes):
             raise TypeError("associated_data must be of type: bytes")
 
+        aesgcm = AESGCM(key)
+        iv = ct[-AES256GCM.IV_LEN:]
         try:
-            aesgcm = AESGCM(key)
-            pt = aesgcm.decrypt(
-                ct[-AES256GCM.IV_LEN:],
-                ct[:-AES256GCM.IV_LEN],
-                associated_data
-            )
+            pt = aesgcm.decrypt(iv, ct[:-AES256GCM.IV_LEN], associated_data)
         except InvalidSignature:
             raise AuthenticationFailed("Invalid ciphertext")
-
         return pt
+
+# --- crypto/x3dh.py (PyNaCl) ---
+
+import nacl.public
+import nacl.utils
+from nacl.bindings import crypto_scalarmult
+
+class X3DHError(Exception):
+    pass
+
+class X3DHKeyBundle(SerializableIface):
+    """
+    Represents a user's X3DH bundle:
+      - identity_key: long-term X25519 keypair
+      - signed_prekey: medium-term X25519 keypair
+      - one_time_prekey: short-term X25519 keypair (optional)
+    """
+    def __init__(self, identity_key=None, signed_prekey=None, one_time_prekey=None):
+        self.identity_key = identity_key or nacl.public.PrivateKey.generate()
+        self.signed_prekey = signed_prekey or nacl.public.PrivateKey.generate()
+        self.one_time_prekey = one_time_prekey or nacl.public.PrivateKey.generate()
+
+    def bundle_public(self):
+        return {
+            "identity_key": bytes(self.identity_key.public_key),
+            "signed_prekey": bytes(self.signed_prekey.public_key),
+            "one_time_prekey": bytes(self.one_time_prekey.public_key),
+        }
+
+    def serialize(self):
+        return {
+            "identity_key": bytes(self.identity_key).hex(),
+            "signed_prekey": bytes(self.signed_prekey).hex(),
+            "one_time_prekey": bytes(self.one_time_prekey).hex(),
+        }
+
+    @classmethod
+    def deserialize(cls, data):
+        return cls(
+            identity_key=nacl.public.PrivateKey(bytes.fromhex(data["identity_key"])),
+            signed_prekey=nacl.public.PrivateKey(bytes.fromhex(data["signed_prekey"])),
+            one_time_prekey=nacl.public.PrivateKey(bytes.fromhex(data["one_time_prekey"])),
+        )
+
+def x3dh_initiate(sender_bundle, receiver_bundle):
+    """
+    Perform X3DH key agreement.
+    sender_bundle: X3DHKeyBundle for the sender (initiator)
+    receiver_bundle: dict with 'identity_key', 'signed_prekey', 'one_time_prekey' public keys
+    Returns the shared secret (32 bytes) and the ephemeral key used.
+    """
+    ephemeral = nacl.public.PrivateKey.generate()
+    # DH1: DH(IK_sender, SPK_receiver)
+    DH1 = crypto_scalarmult(bytes(sender_bundle.identity_key), receiver_bundle['signed_prekey'])
+    # DH2: DH(EK_sender, IK_receiver)
+    DH2 = crypto_scalarmult(bytes(ephemeral), receiver_bundle['identity_key'])
+    # DH3: DH(EK_sender, SPK_receiver)
+    DH3 = crypto_scalarmult(bytes(ephemeral), receiver_bundle['signed_prekey'])
+    # DH4: DH(EK_sender, OPK_receiver)
+    DH4 = crypto_scalarmult(bytes(ephemeral), receiver_bundle['one_time_prekey'])
+    shared_secret = DH1 + DH2 + DH3 + DH4
+    root_key = hkdf(shared_secret, 32, b"x3dh", b"X3DHv1", SHA256(), default_backend())
+    return root_key, ephemeral
+
+def x3dh_receive(receiver_bundle, sender_identity_pub, ephemeral_pub):
+    # DH1: DH(SPK_receiver, IK_sender)
+    DH1 = crypto_scalarmult(bytes(receiver_bundle.signed_prekey), sender_identity_pub)
+    # DH2: DH(IK_receiver, EK_sender)
+    DH2 = crypto_scalarmult(bytes(receiver_bundle.identity_key), ephemeral_pub)
+    # DH3: DH(SPK_receiver, EK_sender)
+    DH3 = crypto_scalarmult(bytes(receiver_bundle.signed_prekey), ephemeral_pub)
+    # DH4: DH(OPK_receiver, EK_sender)
+    DH4 = crypto_scalarmult(bytes(receiver_bundle.one_time_prekey), ephemeral_pub)
+    shared_secret = DH1 + DH2 + DH3 + DH4
+    root_key = hkdf(shared_secret, 32, b"x3dh", b"X3DHv1", SHA256(), default_backend())
+    return root_key
 
 # --- crypto/dhkey.py ---
 
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.x448 import X448PrivateKey, X448PublicKey
-
 class DHKeyPair(DHKeyPairIface):
-    """An implementation of the DHKeyPair Interface."""
-    def __init__(self, dh_pair = None):
-        if dh_pair:
-            if not isinstance(dh_pair, X448PrivateKey):
-                raise TypeError("dh_pair must be of type: X448PrivateKey")
-            self._private_key = dh_pair
+    """X25519 via PyNaCl"""
+    KEY_LEN = 32
+    def __init__(self, sk = None):
+        if sk:
+            if not isinstance(sk, nacl.public.PrivateKey):
+                raise TypeError("sk must be nacl.public.PrivateKey")
+            self._private_key = sk
         else:
-            self._private_key = X448PrivateKey.generate()
-        self._public_key = self._private_key.public_key()
+            self._private_key = nacl.public.PrivateKey.generate()
+        self._public_key = self._private_key.public_key
 
     @classmethod
     def generate_dh(cls):
-        return cls(X448PrivateKey.generate())
+        return cls(nacl.public.PrivateKey.generate())
 
     def dh_out(self, dh_pk):
         if not isinstance(dh_pk, DHPublicKey):
             raise TypeError("dh_pk must be of type: DHPublicKey")
-        return self._private_key.exchange(dh_pk.public_key)
+        return crypto_scalarmult(bytes(self._private_key), dh_pk.public_key)
 
     def serialize(self):
         return {
-            "private_key" : self._sk_bytes().hex(),
-            "public_key" : pk_bytes(self._public_key).hex()
+            "private_key": bytes(self._private_key).hex(),
+            "public_key": bytes(self._public_key).hex()
         }
 
     @classmethod
-    def deserialize(cls, serialized_dh):
-        if not isinstance(serialized_dh, dict):
-            raise TypeError("serialized_dh must be of type: dict")
-
-        private_key = X448PrivateKey.from_private_bytes(
-            bytes.fromhex(serialized_dh["private_key"])
-        )
+    def deserialize(cls, data):
+        private_key = nacl.public.PrivateKey(bytes.fromhex(data["private_key"]))
         return cls(private_key)
 
     @property
@@ -384,38 +340,28 @@ class DHKeyPair(DHKeyPairIface):
     def public_key(self):
         return DHPublicKey(self._public_key)
 
-    def _sk_bytes(self):
-        return self._private_key.private_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PrivateFormat.Raw,
-            encryption_algorithm=serialization.NoEncryption()
-        )
-
 class DHPublicKey(DHPublicKeyIface):
-    """An implementation of the DHPublicKey Interface."""
-    KEY_LEN = 56
-
+    KEY_LEN = 32
     def __init__(self, public_key):
-        if not isinstance(public_key, X448PublicKey):
-            raise TypeError("public_key must be of type: X448PublicKey")
+        if not isinstance(public_key, nacl.public.PublicKey):
+            raise TypeError("public_key must be nacl.public.PublicKey")
         self._public_key = public_key
 
     def pk_bytes(self):
-        return pk_bytes(self._public_key)
+        return bytes(self._public_key)
 
     def is_equal_to(self, dh_pk):
         if not isinstance(dh_pk, DHPublicKey):
-            raise TypeError("dh_pk must be of type: DHPublicKey")
+            raise TypeError("dh_pk must be DHPublicKey")
         return self.pk_bytes() == dh_pk.pk_bytes()
 
     @classmethod
     def from_bytes(cls, pk_bytes_val):
         if not isinstance(pk_bytes_val, bytes):
-            raise TypeError("pk_bytes must be of type: bytes")
+            raise TypeError("pk_bytes must be bytes")
         if not len(pk_bytes_val) == DHPublicKey.KEY_LEN:
-            raise ValueError("pk_bytes must be 56 bytes")
-
-        return cls(X448PublicKey.from_public_bytes(pk_bytes_val))
+            raise ValueError("pk_bytes must be 32 bytes")
+        return cls(nacl.public.PublicKey(pk_bytes_val))
 
     @property
     def public_key(self):
@@ -423,24 +369,12 @@ class DHPublicKey(DHPublicKeyIface):
 
     def serialize(self):
         return {
-            "public_key": pk_bytes(self._public_key).hex()
+            "public_key": bytes(self._public_key).hex()
         }
 
     @classmethod
-    def deserialize(cls, serialized_pk):
-        if not isinstance(serialized_pk, dict):
-            raise TypeError("serialized_pk must be of type: dict")
-
-        public_key = X448PublicKey.from_public_bytes(
-            bytes.fromhex(serialized_pk["public_key"])
-        )
-        return cls(public_key)
-
-def pk_bytes(pk):
-    return pk.public_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PublicFormat.Raw
-    )
+    def deserialize(cls, data):
+        return cls(nacl.public.PublicKey(bytes.fromhex(data["public_key"])))
 
 # --- crypto/kdfchain.py ---
 
@@ -465,10 +399,8 @@ class SymmetricChain(SymmetricChainIface):
     def ratchet(self):
         if self._ck is None:
             raise ValueError("ck is not initialized")
-
         mk = hmac(self._ck, b"mk_ratchet", SHA256(), default_backend())
         self._ck = hmac(self._ck, b"ck_ratchet", SHA256(), default_backend())
-
         return mk
 
     def serialize(self):
@@ -481,7 +413,6 @@ class SymmetricChain(SymmetricChainIface):
     def deserialize(cls, serialized_chain):
         if not isinstance(serialized_chain, dict):
             raise TypeError("serialized_chain must be of type: dict")
-
         return cls(serialized_chain["ck"], serialized_chain["msg_no"])
 
     @property
@@ -661,11 +592,9 @@ class Header:
     def from_bytes(cls, header_bytes):
         if not isinstance(header_bytes, bytes):
             raise TypeError("header_bytes must be of type: bytes")
-
         if header_bytes is None or \
             len(header_bytes) != DHPublicKey.KEY_LEN + 2 * Header.INT_ENCODE_BYTES:
             raise ValueError("Inva")
-
         dh_pk = DHPublicKey.from_bytes(header_bytes[:DHPublicKey.KEY_LEN])
         prev_chain_len = int.from_bytes(
             header_bytes[DHPublicKey.KEY_LEN:-Header.INT_ENCODE_BYTES],
@@ -1067,7 +996,7 @@ class DRSession(SerializableIface):
     def __init__(
         self,
         state: State = None,
-        aead: AEADIFace = AES256CBCHMAC,
+        aead: AEADIFace = AES256GCM,
         keypair: DHKeyPairIface = DHKeyPair,
         public_key: DHPublicKeyIface = DHPublicKey,
         keystorage: MsgKeyStorageIface = MsgKeyStorage,
