@@ -1,0 +1,1163 @@
+Create in Python a protocol named InfinitePX1 add to it Specifications
+Encryption in messaging environments integrates many ideas which often need to be composed separately in different applications. We make an effort to break out ideas into independent specifications so that they can be integrated as appropriate for different projects.
+
+XEdDSA and VXEdDSA
+
+This document describes how to create and verify EdDSA-compatible signatures using public key and private key formats initially defined for the X25519 and X448 elliptic curve Diffie-Hellman functions. This document also describes "VXEdDSA" which extends XEdDSA to make it a verifiable random function, or VRF.(The XEdDSA and VXEdDSA Signature Schemes
+Revision 1, 2016-10-20 [PDF]
+
+Trevor Perrin (editor)
+
+Table of Contents
+1. Introduction
+2. Preliminaries
+2.1. Notation
+2.2. Elliptic curve parameters
+2.3. Elliptic curve conversions
+2.4. Byte sequences
+2.5. Hash functions
+2.6. Hashing to a point with Elligator 2
+3. XEdDSA
+4. VXEdDSA
+5. Curve25519
+6. Curve448
+7. Performance considerations
+8. Security considerations
+9. IPR
+10. Acknowledgements
+11. References
+1. Introduction
+This document describes how to create and verify EdDSA-compatible signatures using public key and private key formats initially defined for the X25519 and X448 elliptic curve Diffie-Hellman functions ([1]–[4]). We refer to this as the "XEdDSA" signature scheme (or "XEd25519" or "XEd448" for specific curves).
+
+XEdDSA enables use of a single key pair format for both elliptic curve Diffie-Hellman and signatures. In some situations it enables using the same key pair for both algorithms.
+
+This document also describes "VXEdDSA" which extends XEdDSA to make it a verifiable random function, or VRF (as defined in [5] and [6]). Successful verification of a VXEdDSA signature returns a VRF output which is guaranteed to be unique for the message and public key. The VRF output for a given message and public key is indistinguishable from random to anyone who has not seen a VXEdDSA signature for that message and key.
+
+2. Preliminaries
+2.1. Notation
+Multiplication of integers a and b modulo prime p is ab (mod p), or a * b (mod p). Division is a/b (mod p) and is calculated as ab-1 (mod p). We define inv(a) (mod p) to return a-1 (mod p) when a is not 0, and return 0 when a is 0. This may be calculated as inv(a) = ap-2 (mod p), per Fermat [7]. The ceil() and floor() functions round up or down to the nearest integer.
+
+Addition and subtraction of elliptic curve points A and B is A + B and A - B. Scalar multiplication of an integer a with an elliptic curve point B yields a new point C = aB.
+
+Integer variables are in lower case (x, y). Points and other variables are in upper case (P, Q). Integer constants are in lowercase except for the Montgomery curve constant A, which follows convention.
+
+Byte sequences are in bold (x, P). A bold integer or elliptic curve point represents a fixed-length byte sequence encoding the value. See Section 2.4 for encoding and decoding details. The concatenation of byte sequences x and P is x || P.
+
+Checking integers or points for equality is done with a == b. Checking byte sequences X and Y for equality is done with bytes_equal(X, Y).
+
+2.2. Elliptic curve parameters
+An elliptic curve used with XEdDSA or VXEdDSDA has the following parameters:
+
+Name	Definition
+B	Base point
+I	Identity point
+p	Field prime
+q	Order of base point (prime; q < p; qB = I)
+c	Cofactor
+d	Twisted Edwards curve constant
+A	Montgomery curve constant (see Section 2.6)
+n	Nonsquare integer modulo p (see Section 2.6)
+|p|	ceil(log2(p))
+|q|	ceil(log2(q))
+b	8 * ( ceil((|p| + 1)/8) ) (= bitlength for encoded point or integer)
+An integer modulo p is a "field element". An integer modulo q is a "scalar".
+
+An elliptic curve is a set of pairs of field elements. Each pair is a "point", the field elements contained in a point are "coordinates", and the coordinates of each point must satisfy some equation which defines the curve. The on_curve(P) function returns true if a purported point P satisfies the curve equation.
+
+The elliptic curve also defines an addition operation between points, and an operation for negating points. Together with the identity point, these operations define a group structure on the curve's points. Adding a point P to itself k times (P + P + P + ...) is scalar multiplication by the scalar k, represented as kP.
+
+XEdDSA and VXEdDSA are defined for twisted Edwards curves consisting of points denoted (x, y). A twisted Edwards curve is birationally equivalent to some Montgomery curve consisting of points denoted (u, v) [8]. We will mainly deal with the twisted Edwards curve, so when we discuss the base point B and identity point I, we are referring to points on the twisted Edwards curve.
+
+The u_to_y function applies a curve-specific birational map to convert the u-coordinate of a point on the Montgomery curve to the y-coordinate of the equivalent point on the twisted Edwards curve.
+
+2.3. Elliptic curve conversions
+Elliptic curve Diffie-Hellman is often calculated using the Montgomery ladder. This gives a simple and efficient calculation that is naturally resistant to timing side channels. The Montgomery ladder also allows each party's public key to be a Montgomery u-coordinate. Using a single coordinate instead of the whole point makes public keys smaller without the expense of point decompression.
+
+However, EdDSA signatures are defined on twisted Edwards curves, where a public key is a compressed point consisting of a twisted Edwards y-coordinate and a sign bit s which is either 0 or 1. A twisted Edwards y-coordinate and sign bit provide an alternate representation of a twisted Edwards point, and determine the x-coordinate as specified in [1] or [2].
+
+Converting from a Montgomery u-coordinate to a twisted Edwards point P can be done with the convert_mont function, below. This function first masks off excess high bits from u, which is standard practice for Curve25519 Montgomery public keys, and is specified in [4]. The function then applies the curve-specific birational map to compute a twisted Ewards y-coordinate, and finally chooses the sign bit as zero.
+
+convert_mont(u):
+    umasked = u (mod 2|p|)
+    P.y = u_to_y(umasked)
+    P.s = 0
+    return P
+
+Because convert_mont doesn't have the Montgomery v, it can't distinguish between the two possibilities for the twisted Edwards sign bit. Forcing the sign bit to zero is an idea from Jivsov [9].
+
+To make private keys compatible with this conversion, we define a twisted Edwards private key as a scalar a where the twisted Edwards public key A = aB has a sign bit of zero (recall that B is the twisted Edwards base point). We allow a Montgomery private key to be any scalar.
+
+Converting a Montgomery private key k to a twisted Edwards public key and private key (A, a) can be done with the calculate_key_pair function ( "A" here is the public key, not the Montgomery curve constant). This function multiplies the Montgomery private key k by the twisted Edwards base point B, then adjusts the private key if necessary to produce a sign bit of zero, following [9].
+
+calculate_key_pair(k):
+    E = kB
+    A.y = E.y
+    A.s = 0
+    if E.s == 1:
+        a = -k (mod q)
+    else:
+        a = k (mod q)
+    return A, a
+
+2.4. Byte sequences
+An integer in bold represents a byte sequence of b bits that encodes the integer in little-endian form. An elliptic curve point in bold (e.g. P) encodes P.y as an integer in little-endian form of b-1 bits in length, followed by a bit for P.s.
+
+2.5. Hash functions
+XEdDSA and VXEdDSA require a cryptographic hash function. The default hash function is SHA-512 [10].
+
+We define hash as a function that applies the cryptographic hash to an input byte sequence, and returns an integer which is the output from the cryptographic hash parsed in little-endian form. Given hash and the curve constants p and b, we define a family of hash functions indexed by nonnegative integers i such that 2|p| - 1 - i > p.
+
+    hashi(X):
+        return hash(2b - 1 - i || X)
+
+So hash0 hashes b/8 bytes of 0xFF prior to the input byte sequence X, hash1 changes the first byte to 0xFE, hash2 changes the first byte to 0xFD, and so on.
+
+Different hashi will be used for different purposes, to provide cryptographic domain separation. Note that hashi will never call hash with the first b bits encoding a valid scalar or elliptic curve point, since the first |p| bits encode an integer greater than p. Note also that hash0 is reserved for use by other specifications, and is not used in this document.
+
+2.6. Hashing to a point with Elligator 2
+VXEdDSA requires mapping an input message to an elliptic curve point, which is done using the Elligator 2 map [11].
+
+The description in [11] is terse and uses different notation, so we briefly review Elligator 2. The Montgomery curve equation for points (u, v) is v2 = u(u2 + Au + 1) (mod p), where A is some curve-specific constant. Elligator 2 maps an integer r onto some u for which u(u2 + Au + 1) has a square root v modulo p. The following lemma is used.
+
+Lemma (Bernstein, Hamburg, Krasnova, Lange). If u1 and u2 are integers modulo p such that u2 = -A - u1 and u2/u1 = nr2 for any r and fixed nonsquare n, then the Montgomery curve equation v2 = u(u2 + Au + 1) has a solution for u = u1 or u = u2, or both.
+
+Proof. Given u1 and u2, define w1 = u1(u12 + Au1 + 1) and w2 = u2(u22 + Au2 + 1). We must prove that a solution exists for either v2 = w1 or v2 = w2. We will show that w2/w1 is either zero or nonsquare, which implies either that w2 is zero, which is square, or that one of w2 or w1 is square.
+
+    w2/w1 = u2(u22 + Au2 + 1) / u1(u12 + Au1 + 1)
+
+    w2/w1 = (u2/u1) (u22 + Au2 + 1) / (u12 + Au1 + 1)
+
+Applying u2 = -A - u1 gives:
+
+    w2/w1 = u2/u1
+
+Applying u2/u1 = nr2 gives:
+
+    w2/w1 = nr2
+
+If r is zero then w2 must be zero, which is square. If r is nonzero then since r2 is square and n is nonsquare, w2/w1 is nonsquare, which implies one of w2 or w1 is square, so the proof is concluded. ▫
+
+From the lemma it follows that u1 = -A/(1 + nr2) and u2 = -Anr2/(1 + nr2). Thus given r, we can easily calculate u1 and u2 and use the Legendre symbol [12] to choose whichever value gives a square w. The elligator2 function implements this map from an integer r to an integer u.
+
+    elligator2(r):
+        u1 = -A * inv(1 + nr2) (mod p)
+        w1 = u1(u12 + Au1 + 1) (mod p)
+        if w1(p-1)/2 == -1 (mod p):
+            u2 = -A - u1 (mod p)
+            return u2
+        return u1
+
+(The inv function is used safely since calling inv(0) when r2 = -1/n will simply map r onto u=0, a valid Montgomery u-coordinate.)
+
+To map a byte sequence onto an Edwards point, we hash the byte sequence and parse the hash output to get a field element r and a sign bit s. Elligator 2 converts r to a Montgomery u-coordinate. The birational map converts the Montgomery u-coordinate to an Edwards point. Finally, we multiply the Edwards point by the cofactor c to ensure it lies within the order q subgroup generated by the base point B. The hash_to_point function implements these steps.
+
+    hash_to_point(X):
+        h = hash2(X)
+        r = h (mod 2|p|)
+        s = floor((h mod 2b) / 2b-1)
+        u = elligator2(r)
+        P.y = u_to_y(u)
+        P.s = s
+        return cP
+
+3. XEdDSA
+The XEdDSA signing algorithm requires the following inputs:
+
+Name	Definition
+k	Montgomery private key (integer mod q)
+M	Message to sign (byte sequence)
+Z	64 bytes secure random data (byte sequence)
+The output is a signature (R || s), a byte sequence of length 2b bits, where R encodes a point and s encodes an integer modulo q.
+
+The XEdDSA verification algorithm requires the following inputs:
+
+Name	Definition
+u	Montgomery public key (byte sequence of b bits)
+M	Message to verify (byte sequence)
+R || s	Signature to verify (byte sequence of 2b bits)
+If XEdDSA verification is successful it returns true, otherwise it returns false. Below is the pseudocode for the xeddsa_sign and xeddsa_verify functions.
+
+xeddsa_sign(k, M, Z):
+    A, a = calculate_key_pair(k)
+    r = hash1(a || M || Z) (mod q)
+    R = rB
+    h = hash(R || A || M) (mod q)
+    s = r + ha (mod q)
+    return R || s
+
+ 
+
+xeddsa_verify(u, M, (R || s)):
+    if u >= p or R.y >= 2|p| or s >= 2|q|:
+        return false
+    A = convert_mont(u)
+    if not on_curve(A):
+        return false
+    h = hash(R || A || M) (mod q)
+    Rcheck = sB - hA
+    if bytes_equal(R, Rcheck):
+        return true
+    return false
+
+4. VXEdDSA
+The VXEdDSA signing algorithm takes the same inputs as XEdDSA. The output is a pair of values. First, a signature (V || h || s), which is a byte sequence of length 3b bits, where V encodes a point and h and s encode integers modulo q. Second, a VRF output byte sequence v of length equal to b bits, formed by multiplying the V output by the cofactor c.
+
+The VXEdDSA verification algorithm takes the same inputs as XEdDSA, except with a VXEdDSA signature instead of an XEdDSA signature. If VXEdDSA verification is successful, it returns a VRF output byte sequence v of length equal to b bits; otherwise it returns false.
+
+Below is the pseudocode for the vxeddsa_sign and vxeddsa_verify functions.
+
+vxeddsa_sign(k, M, Z):
+    A, a = calculate_key_pair(k)
+    Bv = hash_to_point(A || M)
+    V = aBv
+    r = hash3(a || V || Z) (mod q)
+    R = rB
+    Rv = rBv
+    h = hash4(A || V || R || Rv || M) (mod q)
+    s = r + ha (mod q)
+    v = hash5(cV) (mod 2b)
+    return (V || h || s), v
+
+ 
+
+vxeddsa_verify(u, M, (V || h || s)):
+    if u >= p or V.y >= 2|p| or h >= 2|q| or s >= 2|q|:
+        return false
+    A = convert_mont(u)
+    Bv = hash_to_point(A || M)
+    if not on_curve(A) or not on_curve(V):
+        return false
+    if cA == I or cV == I or Bv == I:
+        return false
+    R = sB - hA
+    Rv = sBv - hV
+    hcheck = hash4(A || V || R || Rv || M) (mod q)
+    if bytes_equal(h, hcheck):
+        v = hash5(cV) (mod 2b)
+        return v
+    return false
+
+5. Curve25519
+The Curve25519 elliptic curve specified in [4] can be used with XEdDSA and VXEdDSA, giving XEd25519 and VXEd25519. This curve defines the following parameters.
+
+Name	Definition
+B	convert_mont(9)
+I	(x=0, y=1)
+p	2255 - 19
+q	2252 + 27742317777372353535851937790883648493
+c	8
+d	-121665 / 121666 (mod p)
+A	486662
+n	2
+|p|	255
+|q|	253
+b	256
+The twisted Edwards curve equation is -x2 + y2 = 1 + dx2y2. The u_to_y function implements the birational map from [4] by calculating y = ( u - 1) * inv( u + 1) (mod p).
+
+XEd25519 signatures are valid Ed25519 signatures [1] and vice versa, provided the public keys are converted with the birational map.
+
+Ed25519 allows implementations some flexibility in accepting or rejecting certain invalid signatures (e.g. with s unreduced, or checking the verification equation with or without cofactor multiplication). XEdDSA precisely specifies verification, so may differ from some Ed25519 implementations in accepting or rejecting such signatures (just as some Ed25519 implementations may differ from each other).
+
+The particular verification steps chosen by XEdDSA include rejecting s if it has excess bits but not requiring it to be fully reduced, and checking verification without cofactor multiplication. These choices align with existing Ed25519 code, and lead to simpler implementations.
+
+6. Curve448
+The Curve448 elliptic curve specified in [4] can be used with XEdDSA and VXEdDSA, giving XEd448 and VXEd448. This curve defines the following parameters.
+
+Name	Definition
+B	convert_mont(5)
+I	(x=0, y=1)
+p	2448 - 2224 - 1
+q	2446 - 13818066809895115352007386748515426880336692474882178609894547503885
+c	4
+d	39082 / 39081 (mod p)
+A	156326
+n	-1
+|p|	448
+|q|	446
+b	456
+The twisted Edwards curve equation is x2 + y2 = 1 + dx2y2. The u_to_y function implements the birational map from [4] by calculating y = (1 + u) * inv(1 - u) (mod p).
+
+XEd448 differs from EdDSA [2] in choice of hash function. XEd448 uses SHA-512, whereas [2] recommends a 912-bit hash (912 = 2b). If the hash function is secure, outputs larger than 512 bits don't add security with Curve448, so XEd448 makes a simpler choice.
+
+XEd448 may differ from other proposed instantiations of EdDSA [13] which use the "4-isogenous" curve from [4] rather than the "birationally equivalent" curve. Mapping from the Montgomery form Curve448 to the isogenous curve is more complicated.
+
+7. Performance considerations
+This section contains an incomplete list of performance considerations.
+
+Faster signing: Calling calculate_key_pair for every XEdDSA signature roughly doubles signing time compared to EdDSA, since calculate_key_pair performs an additional scalar multiplication E = kB. VXEdDSA signing is more expensive, so the impact is proportionally less. To avoid this cost signers may cache the (non-secret) point E.
+
+Pre-hashing: Except for XEdDSA verification, the signing and verification algorithms hash the input message twice. For large messages this could be expensive, and would require either large buffers or more complicated APIs.
+
+To prevent this, APIs may wish to specify a maximum message size that all implementations must be capable of buffering. Protocol designers can specify "pre-hashing" of message fields to fit within this. Designers are encouraged to use pre-hashing selectively, so as to limit the potential impact from collision attacks (e.g. pre-hashing the attachments to a message but not the message header or body).
+
+8. Security considerations
+This section contains an incomplete list of security considerations.
+
+Random secret inputs: XEdDSA and VXEdDSA signatures are randomized, they are not deterministic in the sense of [1] or [14]. The caller must pass in a new secret and random 64 byte value each time the signing function is called.
+
+Deterministic signatures are designed to prevent reuse of the same nonce r with different messages, as this reveals the private key a. Consider two XEdDSA signatures (R || s1) and (R || s2) such that:
+
+ s1 = r + h1a (mod q)
+ s2 = r + h2a (mod q)
+
+The private key a can be calculated as a = (s1 - s2)/(h1 - h2) (mod q).
+
+A deterministic signing scheme hashes M with a long-term secret to calculate r, instead of taking r from a random number generator. Because M is also hashed to calculate h the probability that different h get the same r is small. However, if the same message is signed repeatedly, a glitch that affects the calculation of h could cause this to happen (an observation due to Benedikt Schmidt). Also, repeated use of the same r might make it easier to recover information about r through side-channel analysis.
+
+So XEdDSA and VXEdDSA preserve the idea of calculating r by hashing a long-term secret key and the message, but add a random value into the calculation for greater resilience.
+
+Constant time. The signing algorithms must not perform different memory accesses or take different amounts of time depending on secret information. This is typically achieved by "constant time" implementations that execute a fixed sequence of instructions and memory accesses, regardless of secret keys or message contents.
+
+Particular care should be taken with the calculate_key_pair function due to its use of conditional branching. The hash_to_point function also uses conditional branching (within elligator2) and should be made constant time, even though it only handles the message, not secret keys.
+
+Key reuse: It is safe to use the same key pair to produce XEdDSA and VXEdDSA signatures.
+
+In theory, under some circumstances it is safe to use a key pair to produce signatures and also use the same key pair within certain Diffie-Hellman based protocols [15]. In practice this is a complicated topic requiring careful analysis, and is outside the scope of the current document.
+
+9. IPR
+This document is hereby placed in the public domain.
+
+10. Acknowledgements
+Special thanks to Mike Hamburg, creator of the Curve448 elliptic curve and Elligator 2, who was helpful in explaining them and in discussing several design questions.
+
+Much thanks also to Moxie Marlinspike, David J. Wu, Robert Ransom, Peter Schwabe, Benedikt Schmidt, Samuel Neves, and Christian Winnerlein, all of whom contributed significantly to design discussions.
+
+Thanks to Joseph Bonneau, Henry Corrigan-Gibbs, and Tom Ritter for review and editorial feedback, and thanks to Joe for drawing our attention to the discrete-log VRF [16].
+
+Thanks to Daniel Bernstein and Tanja Lange for suggesting the naming scheme, and for discussion.)
+
+X3DH
+
+This document describes the "X3DH" (or "Extended Triple Diffie-Hellman") key agreement protocol. X3DH establishes a shared secret key between two parties who mutually authenticate each other based on public keys. X3DH provides forward secrecy and cryptographic deniability.
+(Moxie Marlinspike, Trevor Perrin (editor)
+
+Table of Contents
+1. Introduction
+2. Preliminaries
+2.1. X3DH parameters
+2.2. Cryptographic notation
+2.3. Roles
+2.4. Keys
+3. The X3DH protocol
+3.1. Overview
+3.2. Publishing keys
+3.3. Sending the initial message
+3.4. Receiving the initial message
+4. Security considerations
+4.1. Authentication
+4.2. Protocol replay
+4.3. Replay and key reuse
+4.4. Deniability
+4.5. Signatures
+4.6. Key compromise
+4.7. Server trust
+4.8. Identity binding
+5. IPR
+6. Acknowledgements
+7. References
+1. Introduction
+This document describes the "X3DH" (or "Extended Triple Diffie-Hellman") key agreement protocol. X3DH establishes a shared secret key between two parties who mutually authenticate each other based on public keys. X3DH provides forward secrecy and cryptographic deniability.
+
+X3DH is designed for asynchronous settings where one user ("Bob") is offline but has published some information to a server. Another user ("Alice") wants to use that information to send encrypted data to Bob, and also establish a shared secret key for future communication.
+
+2. Preliminaries
+2.1. X3DH parameters
+An application using X3DH must decide on several parameters:
+
+Name	Definition
+curve	X25519 or X448
+hash	A 256 or 512-bit hash function (e.g. SHA-256 or SHA-512)
+info	An ASCII string identifying the application
+For example, an application could choose curve as X25519, hash as SHA-512, and info as "MyProtocol".
+
+An application must additionally define an encoding function Encode(PK) to encode an X25519 or X448 public key PK into a byte sequence. The recommended encoding consists of some single-byte constant to represent the type of curve, followed by little-endian encoding of the u-coordinate as specified in [1].
+
+2.2. Cryptographic notation
+X3DH will use the following notation:
+
+The concatenation of byte sequences X and Y is X || Y.
+
+DH(PK1, PK2) represents a byte sequence which is the shared secret output from an Elliptic Curve Diffie-Hellman function involving the key pairs represented by public keys PK1 and PK2. The Elliptic Curve Diffie-Hellman function will be either the X25519 or X448 function from [1], depending on the curve parameter.
+
+Sig(PK, M) represents a byte sequence that is an XEdDSA signature on the byte sequence M and verifies with public key PK, and which was created by signing M with PK's corresponding private key. The signing and verification functions for XEdDSA are specified in[2].
+
+KDF(KM) represents 32 bytes of output from the HKDF algorithm [3] with inputs:
+HKDF input key material = F || KM, where KM is an input byte sequence containing secret key material, and F is a byte sequence containing 32 0xFF bytes if curve is X25519, and 57 0xFF bytes if curve is X448. F is used for cryptographic domain separation with XEdDSA [2].
+HKDF salt = A zero-filled byte sequence with length equal to the hash output length.
+HKDF info = The info parameter from Section 2.1.
+2.3. Roles
+The X3DH protocol involves three parties: Alice, Bob, and a server.
+
+Alice wants to send Bob some initial data using encryption, and also establish a shared secret key which may be used for bidirectional communication.
+
+Bob wants to allow parties like Alice to establish a shared key with him and send encrypted data. However, Bob might be offline when Alice attempts to do this. To enable this, Bob has a relationship with some server.
+
+The server can store messages from Alice to Bob which Bob can later retrieve. The server also lets Bob publish some data which the server will provide to parties like Alice. The amount of trust placed in the server is discussed in Section 4.7.
+
+In some systems the server role might be divided amongst multiple entities, but for simplicity we assume a single server that provides the above functions for Alice and Bob.
+
+2.4. Keys
+X3DH uses the following elliptic curve public keys:
+
+Name	Definition
+IKA	Alice's identity key
+EKA	Alice's ephemeral key
+IKB	Bob's identity key
+SPKB	Bob's signed prekey
+OPKB	Bob's one-time prekey
+All public keys have a corresponding private key, but to simplify description we will focus on the public keys.
+
+The public keys used within an X3DH protocol run must either all be in X25519 form, or they must all be in X448 form, depending on the curve parameter [1].
+
+Each party has a long-term identity public key (IKA for Alice, IKB for Bob).
+
+Bob also has a signed prekey SPKB, which he will change periodically, and a set of one-time prekeys OPKB, which are each used in a single X3DH protocol run. ("Prekeys" are so named because they are essentially protocol messages which Bob publishes to the server prior to Alice beginning the protocol run).
+
+During each protocol run, Alice generates a new ephemeral key pair with public key EKA.
+
+After a successful protocol run Alice and Bob will share a 32-byte secret key SK. This key may be used within some post-X3DH secure communication protocol, subject to the security considerations in Section 4.
+
+3. The X3DH protocol
+3.1. Overview
+X3DH has three phases:
+
+Bob publishes his identity key and prekeys to a server.
+
+Alice fetches a "prekey bundle" from the server, and uses it to send an initial message to Bob.
+
+Bob receives and processes Alice's initial message.
+
+The following sections explain these phases.
+
+3.2. Publishing keys
+Bob publishes a set of elliptic curve public keys to the server, containing:
+
+Bob's identity key IKB
+Bob's signed prekey SPKB
+Bob's prekey signature Sig(IKB, Encode(SPKB))
+A set of Bob's one-time prekeys (OPKB1, OPKB2, OPKB3, ...)
+Bob only needs to upload his identity key to the server once. However, Bob may upload new one-time prekeys at other times (e.g. when the server informs Bob that the server's store of one-time prekeys is getting low).
+
+Bob will also upload a new signed prekey and prekey signature at some interval (e.g. once a week, or once a month). The new signed prekey and prekey signature will replace the previous values.
+
+After uploading a new signed prekey, Bob may keep the private key corresponding to the previous signed prekey around for some period of time, to handle messages using it that have been delayed in transit. Eventually, Bob should delete this private key for forward secrecy (one-time prekey private keys will be deleted as Bob receives messages using them; see Section 3.4).
+
+3.3. Sending the initial message
+To perform an X3DH key agreement with Bob, Alice contacts the server and fetches a "prekey bundle" containing the following values:
+
+Bob's identity key IKB
+Bob's signed prekey SPKB
+Bob's prekey signature Sig(IKB, Encode(SPKB))
+(Optionally) Bob's one-time prekey OPKB
+The server should provide one of Bob's one-time prekeys if one exists, and then delete it. If all of Bob's one-time prekeys on the server have been deleted, the bundle will not contain a one-time prekey.
+
+Alice verifies the prekey signature and aborts the protocol if verification fails. Alice then generates an ephemeral key pair with public key EKA.
+
+If the bundle does not contain a one-time prekey, she calculates:
+
+    DH1 = DH(IKA, SPKB)
+    DH2 = DH(EKA, IKB)
+    DH3 = DH(EKA, SPKB)
+    SK = KDF(DH1 || DH2 || DH3)
+
+If the bundle does contain a one-time prekey, the calculation is modified to include an additional DH:
+
+    DH4 = DH(EKA, OPKB)
+    SK = KDF(DH1 || DH2 || DH3 || DH4)
+
+The following diagram shows the DH calculations between keys. Note that DH1 and DH2 provide mutual authentication, while DH3 and DH4 provide forward secrecy.
+
+DH1...DH4
+DH1...DH4
+
+After calculating SK, Alice deletes her ephemeral private key and the DH outputs.
+
+Alice then calculates an "associated data" byte sequence AD that contains identity information for both parties:
+
+    AD = Encode(IKA) || Encode(IKB)
+
+Alice may optionally append additional information to AD, such as Alice and Bob's usernames, certificates, or other identifying information.
+
+Alice then sends Bob an initial message containing:
+
+Alice's identity key IKA
+Alice's ephemeral key EKA
+Identifiers stating which of Bob's prekeys Alice used
+An initial ciphertext encrypted with some AEAD encryption scheme [4] using AD as associated data and using an encryption key which is either SK or the output from some cryptographic PRF keyed by SK.
+The initial ciphertext is typically the first message in some post-X3DH communication protocol. In other words, this ciphertext typically has two roles, serving as the first message within some post-X3DH protocol, and as part of Alice's X3DH initial message.
+
+After sending this, Alice may continue using SK or keys derived from SK within the post-X3DH protocol for communication with Bob, subject to the security considerations in Section 4.
+
+3.4. Receiving the initial message
+Upon receiving Alice's initial message, Bob retrieves Alice's identity key and ephemeral key from the message. Bob also loads his identity private key, and the private key(s) corresponding to whichever signed prekey and one-time prekey (if any) Alice used.
+
+Using these keys, Bob repeats the DH and KDF calculations from the previous section to derive SK, and then deletes the DH values.
+
+Bob then constructs the AD byte sequence using IKA and IKB, as described in the previous section. Finally, Bob attempts to decrypt the initial ciphertext using SK and AD. If the initial ciphertext fails to decrypt, then Bob aborts the protocol and deletes SK.
+
+If the initial ciphertext decrypts successfully the protocol is complete for Bob. Bob deletes any one-time prekey private key that was used, for forward secrecy. Bob may then continue using SK or keys derived from SK within the post-X3DH protocol for communication with Alice, subject to the security considerations in Section 4.
+
+4. Security considerations
+4.1. Authentication
+Before or after an X3DH key agreement, the parties may compare their identity public keys IKA and IKB through some authenticated channel. For example, they may compare public key fingerprints manually, or by scanning a QR code. Methods for doing this are outside the scope of this document.
+
+If authentication is not performed, the parties receive no cryptographic guarantee as to who they are communicating with.
+
+4.2. Protocol replay
+If Alice's initial message doesn't use a one-time prekey, it may be replayed to Bob and he will accept it. This could cause Bob to think Alice had sent him the same message (or messages) repeatedly.
+
+To mitigate this, a post-X3DH protocol may wish to quickly negotiate a new encryption key for Alice based on fresh random input from Bob. This is the typical behavior of Diffie-Hellman based ratcheting protocols [5].
+
+Bob could attempt other mitigations, such as maintaining a blacklist of observed messages, or replacing old signed prekeys more rapidly. Analyzing these mitigations is beyond the scope of this document.
+
+4.3. Replay and key reuse
+Another consequence of the replays discussed in the previous section is that a successfully replayed initial message would cause Bob to derive the same SK in different protocol runs.
+
+For this reason, any post-X3DH protocol MUST randomize the encryption key before Bob sends encrypted data. For example, Bob could use a DH-based ratcheting protocol to combine SK with a freshly generated DH output to get a randomized encryption key [5].
+
+Failure to randomize Bob's encryption key may cause catastrophic key reuse.
+
+4.4. Deniability
+X3DH doesn't give either Alice or Bob a publishable cryptographic proof of the contents of their communication or the fact that they communicated.
+
+Like in the OTR protocol [6], in some cases a third party that has compromised legitimate private keys from Alice or Bob could be provided a communication transcript that appears to be between Alice and Bob and that can only have been created by some other party that also has access to legitimate private keys from Alice or Bob (i.e. Alice or Bob themselves, or someone else who has compromised their private keys).
+
+If either party is collaborating with a third party during protocol execution, they will be able to provide proof of their communication to such a third party. This limitation on "online" deniability appears to be intrinsic to the asynchronous setting [7].
+
+4.5. Signatures
+It might be tempting to observe that mutual authentication and forward secrecy are achieved by the DH calculations, and omit the prekey signature. However, this would allow a "weak forward secrecy" attack: A malicious server could provide Alice a prekey bundle with forged prekeys, and later compromise Bob's IKB to calculate SK.
+
+Alternatively, it might be tempting to replace the DH-based mutual authentication (i.e. DH1 and DH2) with signatures from the identity keys. However, this reduces deniability, increases the size of initial messages, and increases the damage done if ephemeral or prekey private keys are compromised, or if the signature scheme is broken.
+
+4.6. Key compromise
+Compromise of a party's private keys has a disastrous effect on security, though the use of ephemeral keys and prekeys provides some mitigation.
+
+Compromise of a party's identity private key allows impersonation of that party to others. Compromise of a party's prekey private keys may affect the security of older or newer SK values, depending on many considerations.
+
+A full analysis of all possible compromise scenarios is outside the scope of this document, however a partial analysis of some plausible scenarios is below:
+
+If one-time prekeys are used for a protocol run then a compromise of Bob's identity key and prekey private keys at some future time will not compromise the older SK, assuming the private key for OPKB was deleted.
+
+If one-time prekeys were not used for a protocol run, then a compromise of the private keys for IKB and SPKB from that protocol run would compromise the SK that was calculated earlier. Frequent replacement of signed prekeys mitigates this, as does using a post-X3DH ratcheting protocol which rapidly replaces SK with new keys to provide fresh forward secrecy [5].
+
+Compromise of prekey private keys may enable attacks that extend into the future, such as passive calculation of SK values, and impersonation of arbitrary other parties to the compromised party ("key-compromise impersonation"). These attacks are possible until the compromised party replaces his compromised prekeys on the server (in the case of passive attack); or deletes his compromised signed prekey's private key (in the case of key-compromise impersonation).
+
+4.7. Server trust
+A malicious server could cause communication between Alice and Bob to fail (e.g. by refusing to deliver messages).
+
+If Alice and Bob authenticate each other as in Section 4.1, then the only additional attack available to the server is to refuse to hand out one-time prekeys, causing forward secrecy for SK to depend on the signed prekey's lifetime (as analyzed in the previous section).
+
+This reduction in initial forward secrecy could also happen if one party maliciously drains another party's one-time prekeys, so the server should attempt to prevent this, e.g. with rate limits on fetching prekey bundles.
+
+4.8. Identity binding
+Authentication as in Section 4.1 does not necessarily prevent an "identity misbinding" or "unknown key share" attack.
+
+This results when an attacker ("Charlie") falsely presents Bob's identity key fingerprint to Alice as his (Charlie's) own, and then either forwards Alice's initial message to Bob, or falsely presents Bob's contact information as his own.
+
+The effect of this is that Alice thinks she is sending an initial message to Charlie when she is actually sending it to Bob.
+
+To make this more difficult the parties can include more identifying information into AD, or hash more identifying information into the fingerprint, such as usernames, phone numbers, real names, or other identifying information. Charlie would be forced to lie about these additional values, which might be difficult.
+
+However, there is no way to reliably prevent Charlie from lying about additional values, and including more identity information into the protocol often brings trade-offs in terms of privacy, flexibility, and user interface. A detailed analysis of these trade-offs is beyond the scope of this document.
+
+5. IPR
+This document is hereby placed in the public domain.
+
+6. Acknowledgements
+The X3DH protocol was developed by Moxie Marlinspike and Trevor Perrin.
+
+The underlying "Triple DH" key agreement was proposed by Caroline Kudla and Kenny Paterson in [8], extending the earlier "Double DH" (aka "Protocol 4") key agreement from Simon Blake-Wilson et al [9]. Using signatures in combination with implicitly-authenticated key agreement has been discussed in works like [10] and [11].
+
+Thanks to Mike Hamburg for discussions about identity binding and elliptic curve public keys.
+
+Thanks to Nik Unger and Matthew Green for discussions about deniability.
+
+Thanks to Matthew Green, Tom Ritter, Joseph Bonneau, and Benedikt Schmidt for editorial feedback.)
+Double Ratchet
+
+This document describes the Double Ratchet algorithm, which is used by two parties to exchange encrypted messages based on a shared secret key. The parties derive new keys for every Double Ratchet message so that earlier keys cannot be calculated from later ones. The parties also send Diffie-Hellman public values attached to their messages. The results of Diffie-Hellman calculations are mixed into the derived keys so that later keys cannot be calculated from earlier ones. These properties give some protection to earlier or later encrypted messages in case of a compromise of a party's keys.
+
+(The Double Ratchet Algorithm
+Revision 1, 2016-11-20 [PDF]
+
+Trevor Perrin (editor), Moxie Marlinspike
+
+Table of Contents
+1. Introduction
+2. Overview
+2.1. KDF chains
+2.2. Symmetric-key ratchet
+2.3. Diffie-Hellman ratchet
+2.4. Double Ratchet
+2.6. Out-of-order messages
+3. Double Ratchet
+3.1. External functions
+3.2. State variables
+3.3. Initialization
+3.4. Encrypting messages
+3.5. Decrypting messages
+4. Double Ratchet with header encryption
+4.1. Overview
+4.2. External functions
+4.3. State variables
+4.4. Initialization
+4.5. Encrypting messages
+4.6. Decrypting messages
+5. Implementation considerations
+5.1. Integration with X3DH
+5.2. Recommended cryptographic algorithms
+6. Security considerations
+6.1. Secure deletion
+6.2. Recovery from compromise
+6.3. Cryptanalysis and ratchet public keys
+6.4. Deletion of skipped message keys
+6.5. Deferring new ratchet key generation
+6.6. Truncating authentication tags
+6.7. Implementation fingerprinting
+7. IPR
+8. Acknowledgements
+9. References
+1. Introduction
+The Double Ratchet algorithm is used by two parties to exchange encrypted messages based on a shared secret key. Typically the parties will use some key agreement protocol (such as X3DH [1]) to agree on the shared secret key. Following this, the parties will use the Double Ratchet to send and receive encrypted messages.
+
+The parties derive new keys for every Double Ratchet message so that earlier keys cannot be calculated from later ones. The parties also send Diffie-Hellman public values attached to their messages. The results of Diffie-Hellman calculations are mixed into the derived keys so that later keys cannot be calculated from earlier ones. These properties gives some protection to earlier or later encrypted messages in case of a compromise of a party's keys.
+
+The Double Ratchet and its header encryption variant are presented below, and their security properties are discussed.
+
+2. Overview
+2.1. KDF chains
+A KDF chain is a core concept in the Double Ratchet algorithm.
+
+We define a KDF as a cryptographic function that takes a secret and random KDF key and some input data and returns output data. The output data is indistinguishable from random provided the key isn't known (i.e. a KDF satisfies the requirements of a cryptographic "PRF"). If the key is not secret and random, the KDF should still provide a secure cryptographic hash of its key and input data. The HMAC and HKDF constructions, when instantiated with a secure hash algorithm, meet the KDF definition [2], [3].
+
+We use the term KDF chain when some of the output from a KDF is used as an output key and some is used to replace the KDF key, which can then be used with another input. The below diagram represents a KDF chain processing three inputs and producing three output keys:
+
+text 
+
+A KDF chain has the following properties (using terminology adapted from [4]):
+
+Resilience: The output keys appear random to an adversary without knowledge of the KDF keys. This is true even if the adversary can control the KDF inputs.
+
+Forward security: Output keys from the past appear random to an adversary who learns the KDF key at some point in time.
+
+Break-in recovery: Future output keys appear random to an adversary who learns the KDF key at some point in time, provided that future inputs have added sufficient entropy.
+
+In a Double Ratchet session between Alice and Bob each party stores a KDF key for three chains: a root chain, a sending chain, and a receiving chain (Alice's sending chain matches Bob's receiving chain, and vice versa).
+
+As Alice and Bob exchange messages they also exchange new Diffie-Hellman public keys, and the Diffie-Hellman output secrets become the inputs to the root chain. The output keys from the root chain become new KDF keys for the sending and receiving chains. This is called the Diffie-Hellman ratchet.
+
+The sending and receiving chains advance as each message is sent and received. Their output keys are used to encrypt and decrypt messages. This is called the symmetric-key ratchet
+
+The next sections explain the symmetric-key and Diffie-Hellman ratchets in more detail, then show how they are combined into the Double Ratchet.
+
+2.2. Symmetric-key ratchet
+Every message sent or received is encrypted with a unique message key. The message keys are output keys from the sending and receiving KDF chains. The KDF keys for these chains will be called chain keys.
+
+The KDF inputs for the sending and receiving chains are constant, so these chains don't provide break-in recovery. The sending and receiving chains just ensure that each message is encrypted with a unique key that can be deleted after encryption or decryption. Calculating the next chain key and message key from a given chain key is a single ratchet step in the symmetric-key ratchet. The below diagram shows two steps:
+
+text 
+
+Because message keys aren't used to derive any other keys, message keys may be stored without affecting the security of other message keys. This is useful for handling lost or out-of-order messages (see Section 2.6).
+
+2.3. Diffie-Hellman ratchet
+If an attacker steals one party's sending and receiving chain keys, the attacker can compute all future message keys and decrypt all future messages. To prevent this, the Double Ratchet combines the symmetric-key ratchet with a DH ratchet which updates chain keys based on Diffie-Hellman outputs.
+
+To implement the DH ratchet, each party generates a DH key pair (a Diffie-Hellman public key and private key) which becomes their current ratchet key pair. Every message from either party begins with a header which contains the sender's current ratchet public key. When a new ratchet public key is received from the remote party, a DH ratchet step is performed which replaces the local party's current ratchet key pair with a new key pair.
+
+This results in a "ping-pong" behavior as the parties take turns replacing ratchet key pairs. An eavesdropper who briefly compromises one of the parties might learn the value of a current ratchet private key, but that private key will eventually be replaced with an uncompromised one. At that point, the Diffie-Hellman calculation between ratchet key pairs will define a DH output unknown to the attacker.
+
+The following diagrams show how the DH ratchet derives a shared sequence of DH outputs.
+
+Alice is initialized with Bob's ratchet public key. Alice's ratchet public key isn't yet known to Bob. As part of initialization Alice performs a DH calculation between her ratchet private key and Bob's ratchet public key:
+
+text 
+
+Alice's initial messages advertise her ratchet public key. Once Bob receives one of these messages, Bob performs a DH ratchet step: He calculates the DH output between Alice's ratchet public key and his ratchet private key, which equals Alice's initial DH output. Bob then replaces his ratchet key pair and calculates a new DH output:
+
+text 
+
+Messages sent by Bob advertise his new public key. Eventually, Alice will receive one of Bob's messages and perform a DH ratchet step, replacing her ratchet key pair and deriving two DH outputs, one that matches Bob's latest and a new one:
+
+text 
+
+Messages sent by Alice advertise her new public key. Eventually, Bob will receive one of these messages and perform a second DH ratchet step, and so on:
+
+text 
+
+The DH outputs generated during each DH ratchet step are used to derive new sending and receiving chain keys. The below diagram revisits Bob's first ratchet step. Bob uses his first DH output to derive a receiving chain that matches Alice's sending chain. Bob uses the second DH output to derive a new sending chain:
+
+text 
+
+As the parties take turns performing DH ratchet steps, they take turns introducing new sending chains:
+
+text 
+
+However, the above picture is a simplification. Instead of taking the chain keys directly from DH outputs, the DH outputs are used as KDF inputs to a root chain, and the KDF outputs from the root chain are used as sending and receiving chain keys. Using a KDF chain here improves resilience and break-in recovery.
+
+So a full DH ratchet step consists of updating the root KDF chain twice, and using the KDF output keys as new receiving and sending chain keys:
+
+text 
+
+2.4. Double Ratchet
+Combining the symmetric-key and DH ratchets gives the Double Ratchet:
+
+When a message is sent or received, a symmetric-key ratchet step is applied to the sending or receiving chain to derive the message key.
+
+When a new ratchet public key is received, a DH ratchet step is performed prior to the symmetric-key ratchet to replace the chain keys.
+
+In the below diagram Alice has been initialized with Bob's ratchet public key and a shared secret which is the initial root key. As part of initialization Alice generates a new ratchet key pair, and feeds the DH output to the root KDF to calculate a new root key (RK) and sending chain key (CK):
+
+text 
+
+When Alice sends her first message A1, she applies a symmetric-key ratchet step to her sending chain key, resulting in a new message key (message keys will be labelled with the message they encrypt or decrypt). The new chain key is stored, but the message key and old chain key can be deleted:
+
+text 
+
+If Alice next receives a response B1 from Bob, it will contain a new ratchet public key (Bob's public keys are labelled with the message when they were first received). Alice applies a DH ratchet step to derive new receiving and sending chain keys. Then she applies a symmetric-key ratchet step to the receiving chain to get the message key for the received message:
+
+text 
+
+Suppose Alice next sends a message A2, receives a message B2 with Bob's old ratchet public key, then sends messages A3 and A4. Alice's sending chain will ratchet three steps, and her receiving chain will ratchet once:
+
+text 
+
+Suppose Alice then receives messages B3 and B4 with Bob's next ratchet key, then sends a message A5. Alice's final state will be as follows:
+
+text 
+
+2.6. Out-of-order messages
+The Double Ratchet handles lost or out-of-order messages by including in each message header the message's number in the sending chain (N=0,1,2,...) and the length (number of message keys) in the previous sending chain (PN). This enables the recipient to advance to the relevant message key while storing skipped message keys in case the skipped messages arrive later.
+
+On receiving a message, if a DH ratchet step is triggered then the received PN minus the length of the current receiving chain is the number of skipped messages in that receiving chain. The received N is the number of skipped messages in the new receiving chain (i.e. the chain after the DH ratchet).
+
+If a DH ratchet step isn't triggered, then the received N minus the length of the receiving chain is the number of skipped messages in that chain.
+
+For example, consider the message sequence from the previous section when messages B2 and B3 are skipped. Message B4 will trigger Alice's DH ratchet step (instead of B3). Message B4 will have PN=2 and N=1. On receiving B4 Alice will have a receiving chain of length 1 (B1), so Alice will store message keys for B2 and B3 so they can be decrypted if they arrive later:
+
+text 
+
+3. Double Ratchet
+3.1. External functions
+To instantiate the Double Ratchet requires defining the following functions. For recommendations, see Section 5.2.
+
+GENERATE_DH(): Returns a new Diffie-Hellman key pair.
+
+DH(dh_pair, dh_pub): Returns the output from the Diffie-Hellman calculation between the private key from the DH key pair dh_pair and the DH public key dh_pub. If the DH function rejects invalid public keys, then this function may raise an exception which terminates processing.
+
+KDF_RK(rk, dh_out): Returns a pair (32-byte root key, 32-byte chain key) as the output of applying a KDF keyed by a 32-byte root key rk to a Diffie-Hellman output dh_out.
+
+KDF_CK(ck): Returns a pair (32-byte chain key, 32-byte message key) as the output of applying a KDF keyed by a 32-byte chain key ck to some constant.
+
+ENCRYPT(mk, plaintext, associated_data): Returns an AEAD encryption of plaintext with message key mk [5]. The associated_data is authenticated but is not included in the ciphertext. Because each message key is only used once, the AEAD nonce may handled in several ways: fixed to a constant; derived from mk alongside an independent AEAD encryption key; derived as an additional output from KDF_CK(); or chosen randomly and transmitted.
+
+DECRYPT(mk, ciphertext, associated_data): Returns the AEAD decryption of ciphertext with message key mk. If authentication fails, an exception will be raised that terminates processing.
+
+HEADER(dh_pair, pn, n): Creates a new message header containing the DH ratchet public key from the key pair in dh_pair, the previous chain length pn, and the message number n. The returned header object contains ratchet public key dh and integers pn and n.
+
+CONCAT(ad, header): Encodes a message header into a parseable byte sequence, prepends the ad byte sequence, and returns the result. If ad is not guaranteed to be a parseable byte sequence, a length value should be prepended to the output to ensure that the output is parseable as a unique pair (ad, header).
+
+A MAX_SKIP constant also needs to be defined. This specifies the maximum number of message keys that can be skipped in a single chain. It should be set high enough to tolerate routine lost or delayed messages, but low enough that a malicious sender can't trigger excessive recipient computation.
+
+3.2. State variables
+The following state variables are tracked by each party:
+
+DHs: DH Ratchet key pair (the "sending" or "self" ratchet key)
+
+DHr: DH Ratchet public key (the "received" or "remote" key)
+
+RK: 32-byte Root Key
+
+CKs, CKr: 32-byte Chain Keys for sending and receiving
+
+Ns, Nr: Message numbers for sending and receiving
+
+PN: Number of messages in previous sending chain
+
+MKSKIPPED: Dictionary of skipped-over message keys, indexed by ratchet public key and message number. Raises an exception if too many elements are stored.
+
+In the Python code that follows, the state variables are accessed as members of a state object.
+
+3.3. Initialization
+Prior to initialization both parties must use some key agreement protocol to agree on a 32-byte shared secret key SK and Bob's ratchet public key. These values will be used to populate Alice's sending chain key and Bob's root key. Bob's chain keys and Alice's receiving chain key will be left empty, since they are populated by each party's first DH ratchet step.
+
+(This assumes Alice begins sending messages first, and Bob doesn't send messages until he has received one of Alice's messages. To allow Bob to send messages immediately after initialization Bob's sending chain key and Alice's receiving chain key could be initialized to a shared secret. For the sake of simplicity we won't consider this further.)
+
+Once Alice and Bob have agreed on SK and Bob's ratchet public key, Alice calls RatchetInitAlice() and Bob calls RatchetInitBob():
+
+def RatchetInitAlice(state, SK, bob_dh_public_key):
+    state.DHs = GENERATE_DH()
+    state.DHr = bob_dh_public_key
+    state.RK, state.CKs = KDF_RK(SK, DH(state.DHs, state.DHr)) 
+    state.CKr = None
+    state.Ns = 0
+    state.Nr = 0
+    state.PN = 0
+    state.MKSKIPPED = {}
+
+def RatchetInitBob(state, SK, bob_dh_key_pair):
+    state.DHs = bob_dh_key_pair
+    state.DHr = None
+    state.RK = SK
+    state.CKs = None
+    state.CKr = None
+    state.Ns = 0
+    state.Nr = 0
+    state.PN = 0
+    state.MKSKIPPED = {}
+3.4. Encrypting messages
+RatchetEncrypt() is called to encrypt messages. This function performs a symmetric-key ratchet step, then encrypts the message with the resulting message key. In addition to the message's plaintext it takes an AD byte sequence which is prepended to the header to form the associated data for the underlying AEAD encryption:
+
+def RatchetEncrypt(state, plaintext, AD):
+    state.CKs, mk = KDF_CK(state.CKs)
+    header = HEADER(state.DHs, state.PN, state.Ns)
+    state.Ns += 1
+    return header, ENCRYPT(mk, plaintext, CONCAT(AD, header))
+3.5. Decrypting messages
+RatchetDecrypt() is called to decrypt messages. This function does the following:
+
+If the message corresponds to a skipped message key this function decrypts the message, deletes the message key, and returns.
+
+Otherwise, if a new ratchet key has been received this function stores any skipped message keys from the receiving chain and performs a DH ratchet step to replace the sending and receiving chains.
+
+This function then stores any skipped message keys from the current receiving chain, performs a symmetric-key ratchet step to derive the relevant message key and next chain key, and decrypts the message.
+
+If an exception is raised (e.g. message authentication failure) then the message is discarded and changes to the state object are discarded. Otherwise, the decrypted plaintext is accepted and changes to the state object are stored:
+
+ 
+
+def RatchetDecrypt(state, header, ciphertext, AD):
+    plaintext = TrySkippedMessageKeys(state, header, ciphertext, AD)
+    if plaintext != None:
+        return plaintext
+    if header.dh != state.DHr:                 
+        SkipMessageKeys(state, header.pn)
+        DHRatchet(state, header)
+    SkipMessageKeys(state, header.n)             
+    state.CKr, mk = KDF_CK(state.CKr)
+    state.Nr += 1
+    return DECRYPT(mk, ciphertext, CONCAT(AD, header))
+
+def TrySkippedMessageKeys(state, header, ciphertext, AD):
+    if (header.dh, header.n) in state.MKSKIPPED:
+        mk = state.MKSKIPPED[header.dh, header.n]
+        del state.MKSKIPPED[header.dh, header.n]
+        return DECRYPT(mk, ciphertext, CONCAT(AD, header))
+    else:
+        return None
+
+def SkipMessageKeys(state, until):
+    if state.Nr + MAX_SKIP < until:
+        raise Error()
+    if state.CKr != None:
+        while state.Nr < until:
+            state.CKr, mk = KDF_CK(state.CKr)
+            state.MKSKIPPED[state.DHr, state.Nr] = mk
+            state.Nr += 1
+
+def DHRatchet(state, header):
+    state.PN = state.Ns                          
+    state.Ns = 0
+    state.Nr = 0
+    state.DHr = header.dh
+    state.RK, state.CKr = KDF_RK(state.RK, DH(state.DHs, state.DHr))
+    state.DHs = GENERATE_DH()
+    state.RK, state.CKs = KDF_RK(state.RK, DH(state.DHs, state.DHr))
+4. Double Ratchet with header encryption
+4.1. Overview
+This section describes the header encryption variant of the Double Ratchet.
+
+Message headers contain ratchet public keys and (PN, N) values. In some cases it may be desirable to encrypt the headers so that an eavesdropper can't tell which messages belong to which sessions, or the ordering of messages within a session.
+
+With header encryption each party stores a symmetric header key and next header key for both the sending and receiving directions. The sending header key is used for encrypting headers for the current sending chain.
+
+When a recipient receives a message she must first associate the message with its relevant Double Ratchet session (assuming she has different sessions with different parties). How this is done is outside of the scope of this document, although the Pond protocol offers some ideas [6].
+
+After associating the message with a session, the recipient attempts to decrypt the header with that session's receiving header key, next header key, and any header keys corresponding to skipped messages. Successful decryption with the next header key indicates the recipient must perform a DH ratchet step. During a DH ratchet step the next header keys replace the current header keys, and new next header keys are taken as additional output from the root KDF.
+
+In the below diagram Alice has been initialized with Bob's ratchet public key and shared secrets for the initial root key, the sending header key (HK), and the receiving next header key (NHK). As part of initialization Alice generates her ratchet key pair and updates the root chain to derive a new root key, sending chain key, and sending next header key (NHK):
+
+text 
+
+When Alice sends her first message A1, she encrypts its header with the sending header key she was initialized with:
+
+text 
+
+If Alice next receives a response B1 from Bob, its header will be encrypted with the receiving next header key that she was initialized with. Alice applies a DH ratchet step which shifts the next header keys into the current header keys, and generates new next header keys:
+
+text 
+
+Alice next sends a message A2, then receives a message B2 using the current receiving header key and containing the same ratchet public key she received in message B1. Alice then sends messages A3 and A4. The current header keys are used for all sent and received messages:
+
+text 
+
+Alice then receives message B3 containing Bob's next ratchet key and with its header encrypted by the next receiving header key. Successful header decryption with the next header key will trigger a DH ratchet step. Alice then receives B4 with the same ratchet key and header key, then sends a message A5. Alice's final state will be as follows:
+
+text 
+
+4.2. External functions
+Additional functions are required for header encryption:
+
+HENCRYPT(hk, plaintext): Returns the AEAD encryption of plaintext with header key hk. Because the same hk will be used repeatedly, the AEAD nonce must either be a stateful non-repeating value, or must be a random non-repeating value chosen with at least 128 bits of entropy.
+
+HDECRYPT(hk, ciphertext): Returns the authenticated decryption of ciphertext with header key hk. If authentication fails, or if the header key hk is empty (None), returns None.
+
+KDF_RK_HE(rk, dh_out): Returns a new root key, chain key, and next header key as the output of applying a KDF keyed by root key rk to a Diffie-Hellman output dh_out.
+
+4.3. State variables
+Additional state variables are required:
+
+HKs, HKr: 32-byte Header Keys for sending and receiving
+NHKs, NHKr: 32-byte Next Header Keys for sending and receiving
+The following variable's definition is changed:
+
+MKSKIPPED: Dictionary of skipped-over message keys, indexed by header key and message number. Raises an exception if too many elements are stored.
+4.4. Initialization
+Some additional shared secrets must be used to initialize the header keys:
+
+Alice's sending header key and Bob's next receiving header key must be set to the same value, so that Alice's first message triggers a DH ratchet step for Bob.
+
+Alice's next receiving header key and Bob's next sending header key must be set to the same value, so that after Bob's first DH ratchet step, Bob's next message triggers a DH ratchet step for Alice.
+
+Once Alice and Bob have agreed on SK, Bob's ratchet public key, and these additional values, Alice calls RatchetInitAliceHE() and Bob calls RatchetInitBobHE():
+
+ 
+
+def RatchetInitAliceHE(state, SK, bob_dh_public_key, shared_hka, shared_nhkb):
+    state.DHRs = GENERATE_DH()
+    state.DHRr = bob_dh_public_key
+    state.RK, state.CKs, state.NHKs = KDF_RK_HE(SK, DH(state.DHRs, state.DHRr)) 
+    state.CKr = None
+    state.Ns = 0
+    state.Nr = 0
+    state.PN = 0
+    state.MKSKIPPED = {}
+    state.HKs = shared_hka
+    state.HKr = None
+    state.NHKr = shared_nhkb
+
+def RatchetInitBobHE(state, SK, bob_dh_key_pair, shared_hka, shared_nhkb):
+    state.DHRs = bob_dh_key_pair
+    state.DHRr = None
+    state.RK = SK 
+    state.CKs = None
+    state.CKr = None
+    state.Ns = 0
+    state.Nr = 0
+    state.PN = 0
+    state.MKSKIPPED = {}
+    state.HKs = None
+    state.NHKs = shared_nhkb
+    state.HKr = None
+    state.NHKr = shared_hka
+4.5. Encrypting messages
+The RatchetEncryptHE() function is called to encrypt messages with header encryption:
+
+def RatchetEncryptHE(state, plaintext, AD):
+    state.CKs, mk = KDF_CK(state.CKs)
+    header = HEADER(state.DHRs, state.PN, state.Ns)
+    enc_header = HENCRYPT(state.HKs, header)
+    state.Ns += 1
+    return enc_header, ENCRYPT(mk, plaintext, CONCAT(AD, enc_header))
+4.6. Decrypting messages
+RatchetDecryptHE() is called to decrypt messages with header encryption:
+
+def RatchetDecryptHE(state, enc_header, ciphertext, AD):
+    plaintext = TrySkippedMessageKeysHE(state, enc_header, ciphertext, AD)
+    if plaintext != None:
+        return plaintext
+    header, dh_ratchet = DecryptHeader(state, enc_header)
+    if dh_ratchet:
+        SkipMessageKeysHE(state, header.pn)
+        DHRatchetHE(state, header)
+    SkipMessageKeysHE(state, header.n)
+    state.CKr, mk = KDF_CK(state.CKr)
+    state.Nr += 1
+    return DECRYPT(mk, ciphertext, CONCAT(AD, enc_header))
+
+def TrySkippedMessageKeysHE(state, enc_header, ciphertext, AD):
+    for ((hk, n), mk) in state.MKSKIPPED.items():
+        header = HDECRYPT(hk, enc_header)
+        if header != None and header.n == n:
+            del state.MKSKIPPED[hk, n]
+            return DECRYPT(mk, ciphertext, CONCAT(AD, enc_header))
+    return None
+  
+def DecryptHeader(state, enc_header):
+    header = HDECRYPT(state.HKr, enc_header)
+    if header != None:
+        return header, False
+    header = HDECRYPT(state.NHKr, enc_header)
+    if header != None:
+        return header, True
+    raise Error()
+
+def SkipMessageKeysHE(state, until):
+    if state.Nr + MAX_SKIP < until:
+        raise Error()
+    if state.CKr != None:
+        while state.Nr < until:
+            state.CKr, mk = KDF_CK(state.CKr)
+            state.MKSKIPPED[state.HKr, state.Nr] = mk
+            state.Nr += 1
+ 
+
+def DHRatchetHE(state, header):
+    state.PN = state.Ns
+    state.Ns = 0
+    state.Nr = 0
+    state.HKs = state.NHKs
+    state.HKr = state.NHKr
+    state.DHRr = header.dh
+    state.RK, state.CKr, state.NHKr = KDF_RK_HE(state.RK, DH(state.DHRs, state.DHRr))
+    state.DHRs = GENERATE_DH()
+    state.RK, state.CKs, state.NHKs = KDF_RK_HE(state.RK, DH(state.DHRs, state.DHRr))
+5. Implementation considerations
+5.1. Integration with X3DH
+The Double Ratchet algorithm can be used in combination with the X3DH key agreement protocol [1]. The Double Ratchet plays the role of a "post-X3DH" protocol which takes the session key SK negotiated by X3DH and uses it as the Double Ratchet's initial root key.
+
+The following outputs from X3DH are used by the Double Ratchet:
+
+The SK output from X3DH becomes the SK input to Double Ratchet initialization (see Section 3.3).
+
+The AD output from X3DH becomes the AD input to Double Ratchet encryption and decryption (see Section 3.4 and Section 3.5).
+
+Bob's signed prekey from X3DH (SPKB) becomes Bob's initial ratchet public key (and corresponding key pair) for Double Ratchet initialization.
+
+Any Double Ratchet message encrypted using Alice's initial sending chain can serve as an "initial ciphertext" for X3DH. To deal with the possibility of lost or out-of-order messages, a recommended pattern is for Alice to repeatedly send the same X3DH initial message prepended to all of her Double Ratchet messages until she receives Bob's first Double Ratchet response message.
+
+5.2. Recommended cryptographic algorithms
+The following choices are recommended for instantiating the cryptographic functions from Section 3.1:
+
+GENERATE_DH(): This function is recommended to generate a key pair based on the Curve25519 or Curve448 elliptic curves [7].
+
+DH(dh_pair, dh_pub): This function is recommended to return the output from the X25519 or X448 function as defined in [7]. There is no need to check for invalid public keys.
+
+KDF_RK(rk, dh_out): This function is recommended to be implemented using HKDF [3] with SHA-256 or SHA-512 [8], using rk as HKDF salt, dh_out as HKDF input key material, and an application-specific byte sequence as HKDF info. The info value should be chosen to be distinct from other uses of HKDF in the application.
+
+KDF_CK(ck): HMAC [2] with SHA-256 or SHA-512 [8] is recommended, using ck as the HMAC key and using separate constants as input (e.g. a single byte 0x01 as input to produce the message key, and a single byte 0x02 as input to produce the next chain key).
+
+ENCRYPT(mk, plaintext, associated_data): This function is recommended to be implemented with an AEAD encryption scheme based on either SIV or a composition of CBC with HMAC [5], [9]. These schemes provide some misuse-resistance in case a key is mistakenly used multiple times. A concrete recommendation based on CBC and HMAC is as follows:
+
+HKDF is used with SHA-256 or SHA-512 to generate 80 bytes of output. The HKDF salt is set to a zero-filled byte sequence equal to the hash's output length. HKDF input key material is set to mk. HKDF info is set to an application-specific byte sequence distinct from other uses of HKDF in the application.
+
+The HKDF output is divided into a 32-byte encryption key, a 32-byte authentication key, and a 16-byte IV.
+
+The plaintext is encrypted using AES-256 in CBC mode with PKCS#7 padding, using the encryption key and IV from the previous step [10], [11].
+
+HMAC is calculated using the authentication key and the same hash function as above [2]. The HMAC input is the associated_data prepended to the ciphertext. The HMAC output is appended to the ciphertext.
+
+6. Security considerations
+6.1. Secure deletion
+The Double Ratchet algorithm is designed to provide security against an attacker who records encrypted messages and then compromises the sender or receiver at a later time. This security could be defeated if deleted plaintext or keys could be recovered by an attacker with low-level access to the compromised device. Recovering deleted data from storage media is a complicated topic which is outside the scope of this document.
+
+6.2. Recovery from compromise
+The DH ratchet is designed to recover security against a passive eavesdropper who observes encrypted messages after compromising one (or both) of the parties to a session. Despite this mitigation, a compromise of secret keys or of device integrity will have a devastating effect on the security of future communications. For example:
+
+The attacker could use the compromised keys to impersonate the compromised party (e.g. using the compromised party's identity private key with X3DH to create new sessions).
+
+The attacker could substitute her own ratchet keys via continuous active man-in-the-middle attack, to maintain eavesdropping on the compromised session.
+
+The attacker could modify a compromised party's RNG so that future ratchet private keys are predictable.
+
+If a party suspects its keys or devices have been compromised, it must replace them immediately.
+
+6.3. Cryptanalysis and ratchet public keys
+Because all DH ratchet computations are mixed into the root key, an attacker who can decrypt a session with passive cryptanalysis might lose this ability if she fails to observe some ratchet public key.
+
+This is not a reliable countermeasure against cryptanalysis, of course. If weaknesses are discovered in any of the cryptographic algorithms a session relies upon, the session should be discarded and replaced with a new session using strong cryptography.
+
+6.4. Deletion of skipped message keys
+Storing skipped message keys introduces some risks:
+
+A malicious sender could induce recipients to store large numbers of skipped message keys, possibly causing denial-of-service due to consuming storage space.
+
+The lost messages may have been seen (and recorded) by an attacker, even though they didn't reach the recipient. The attacker can compromise the intended recipient at a later time to retrieve the skipped message keys.
+
+To mitigate the first risk parties should set reasonable per-session limits on the number of skipped message keys that will be stored (e.g. 1000). To mitigate the second risk parties should delete skipped message keys after an appropriate interval. Deletion could be triggered by a timer, or by counting a number of events (messages received, DH ratchet steps, etc.).
+
+6.5. Deferring new ratchet key generation
+During each DH ratchet step a new ratchet key pair and sending chain are generated. As the sending chain is not needed right away, these steps could be deferred until the party is about to send a new message. This would slightly increase security by shortening the lifetime of ratchet keys, at the cost of some complexity.
+
+6.6. Truncating authentication tags
+If the ENCRYPT() function is implemented using CBC and HMAC as described in Section 5.2, then truncating the final HMAC output to 128 bits to reduce message size is acceptable. Truncating it further might be acceptable, though requires careful analysis. In no case should the final HMAC be truncated to less than 64 bits.
+
+If the ENCRYPT() function is implemented differently, then truncation might require a more complicated analysis and is not recommended.
+
+6.7. Implementation fingerprinting
+If this protocol is used in settings with anonymous parties, care should be taken that implementations behave identically in all cases.
+
+In an anonymous context, implementations are advised to follow the algorithms from Sections 3 and 4 precisely. Such implementations are also advised to use identical limits for the number of skipped message keys stored, and identical deletion policies for skipped message keys. Deletion policies should be based on deterministic events (e.g. messages received), rather than time.
+)
+Add aslo sealed sender (Technology preview: Sealed sender for Signal
+jlund on 29 Oct 2018
+
+In addition to the end-to-end encryption that protects every Signal message, the Signal service is designed to minimize the data that is retained about Signal users. By design, it does not store a record of your contacts, social graph, conversation list, location, user avatar, user profile name, group memberships, group titles, or group avatars.
+
+We have been exploring techniques to further reduce the amount of information that is accessible to the service, and the latest beta release includes changes designed to move Signal incrementally closer to the goal of hiding another piece of metadata: who is messaging whom.
+
+Pushing the envelope
+When you send a traditional piece of physical mail, the outside of the package typically includes the address of both the sender and the recipient. The same basic components are present in a Signal message. The service can’t “see into” the encrypted package contents, but it uses the information written on the outside of the package to facilitate asynchronous message delivery between users.
+
+While the service always needs to know where a message should be delivered, ideally it shouldn’t need to know who the sender is. It would be better if the service could handle packages where only the destination is written on the outside, with a blank space where the “from” address used to be.
+
+Traditionally, a Signal client sends a message by connecting to the service over TLS, authenticating, and handing off the encrypted message contents along with a destination. The authentication process serves two primary functions:
+
+The service can validate the sender’s identity to help prevent spoofing and provide the recipient with some assurance about who sent the message.
+The service can use the sender’s identity to apply rate limiting and abuse protection.
+In order to remove the “from” address from the outside of the package, we need a new process that will account for these two existing functions.
+
+Special delivery
+Sender certificates
+
+To prevent spoofing, clients periodically retrieve a short-lived sender certificate from the service attesting to their identity. The certificate contains the client’s phone number, public identity key, and an expiration timestamp. Clients can include the sender certificate when a message is sent, and receiving clients can easily check its validity.
+
+Delivery tokens
+
+To prevent abuse, clients derive a 96-bit delivery token from their profile key and register it with the service. The service requires clients to prove knowledge of the delivery token for a user in order to transmit “sealed sender” messages to that user.
+
+As a reminder, Signal Profiles are end-to-end encrypted, and the profile keys are exchanged via the same Signal Protocol messaging channel that protects conversations and calls. Profiles are shared with your contacts, other people or groups who you explicitly approve, and in conversations that you create. Building on this existing foundation allows delivery tokens to be seamlessly exchanged behind the scenes.
+
+Since knowledge of a user’s profile key is necessary in order to derive that user’s delivery token, this restricts “sealed sender” messages to contacts who are less likely to require rate limits and other abuse protection. Additionally, blocking a user who has access to a profile key will trigger a profile key rotation.
+
+On the opposite end of the spectrum, users who want to live on the edge can enable an optional setting that allows them to receive incoming “sealed sender” messages from non-contacts and people with whom they haven’t shared their profile or delivery token. This comes at the increased risk of abuse, but allows for every incoming message to be sent with “sealed sender,” without requiring any normal message traffic to first discover a profile key.
+
+Settings screen for Sealed Sender
+
+Encryption
+
+Message contents are end-to-end encrypted with the Signal Protocol as normal, but the “envelope” containing the sender certificate as well as the message ciphertext is then also encrypted using the sender and recipient identity keys:
+
+message_ciphertext             = signal_protocol_encrypt(message)
+e_pub, e_priv                  = X25519.generateEphemeral()
+e_chain, e_cipherKey, e_macKey = HKDF(salt="UnidentifiedDelivery" || recipientIdentityPublic || e_pub, ikm=ECDH(recipientIdentityPublic, e_priv), info="")
+e_ciphertext                   = AES_CTR(key=e_cipherKey, input=senderIdentityPublic)
+e_mac                          = Hmac256(key=e_macKey, input=e_ciphertext)
+
+s_cipherKey, s_macKey = HKDF(salt=e_chain || e_ciphertext || e_mac, ikm=ECDH(recipientIdentityPublic, senderIdentityPrivate), info="")
+s_ciphertext          = AES_CTR(key=s_cipherKey, input=sender_certificate || message_ciphertext)
+s_mac                 = Hmac256(key=s_macKey, input=s_ciphertext)
+
+message_to_send = s_ciphertext || s_mac
+Sending a message
+
+Putting it all together, the process of sending a “sealed sender” message looks like this:
+
+Encrypt the message using Signal Protocol as usual.
+Include a sender certificate in the envelope.
+Encrypt the envelope to the recipient.
+Without authenticating, hand the encrypted envelope to the service along with the recipient’s delivery token.
+The recipient of the message can then decrypt the envelope, validate that the identity key which was used to encrypt the envelope matches the sender certificate, and continue processing as normal.
+
+The future is in transit
+As clients upgrade, messages will automatically be delivered using sealed sender whenever possible. Users can enable an optional status icon that will be displayed in the detailed information view for a message to indicate when this happens.
+
+These protocol changes are an incremental step, and we are continuing to work on improvements to Signal’s metadata resistance. In particular, additional resistance to traffic correlation via timing attacks and IP addresses are areas of ongoing development.
+
+We do not collect or store any sensitive information about our users, and that won’t ever change.
+
+Deliver us from beta
+Our beta releases are not for the faint of heart. If you need a stable and reliable messaging experience, we strongly encourage you to wait. However, if you’re ready for a life of adventure (and occasional sadness), we invite you to join the Signal public beta and help us test the latest release on your favorite platform.
+
+Beta releases that support sealed sender will be rolling out over the next few days. Be sure to update all of your devices (including linked Desktops). We’re excited to hear what you think!
+
+)
