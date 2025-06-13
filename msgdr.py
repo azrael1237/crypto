@@ -319,7 +319,8 @@ class DHKeyPair(DHKeyPairIface):
     def dh_out(self, dh_pk):
         if not isinstance(dh_pk, DHPublicKey):
             raise TypeError("dh_pk must be of type: DHPublicKey")
-        return crypto_scalarmult(bytes(self._private_key), dh_pk.public_key)
+        # FIX: convert to bytes
+        return crypto_scalarmult(bytes(self._private_key), bytes(dh_pk.public_key))
 
     def serialize(self):
         return {
