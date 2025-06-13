@@ -1,446 +1,578 @@
 import sys
-import base64
-import json
-import hashlib
-import pickle
-import time
-from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
-    QTextEdit, QListWidget, QListWidgetItem, QStackedWidget, QMessageBox, QInputDialog
-)
-from PySide6.QtCore import QTimer, Qt
 import socketio
-import pysqlcipher3.dbapi2 as sqlcipher
+from cryptography.hazmat.primitives.asymmetric import x25519, ed25519
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes, hmac, padding, serialization
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from PySide6.QtWidgets import QApplication, QPushButton, QVBoxLayout, QHBoxLayout, QTextEdit, QLineEdit, QWidget, QLabel, QMainWindow
+from PySide6.QtCore import QObject, QThread, Signal
+import base64
+import argparse
 
-from msgdr import DRSession, DHKeyPair, DHPublicKey, MsgKeyStorage, RootChain, SymmetricChain, Ratchet
-from ecdsa import make_keypair, sign_message, verify_signature
+# ================= UTILS =================
 
-# --- SQLCipher Local DB Setup ---
-DB_PASSWORD = "798laůdaf5668alfáaojdlad5458ad.@msldmsf5"
-DB_PATH = "chat_local.sqlite3"
+MAX_SKIP = 10
 
-def init_db():
-    conn = sqlcipher.connect(DB_PATH, check_same_thread=False)
-    c = conn.cursor()
-    c.execute("PRAGMA key = '{}';".format(DB_PASSWORD))
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id TEXT,
-            sender TEXT,
-            recipient TEXT,
-            payload TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            sealed BOOLEAN DEFAULT 1
-        );
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS contacts (
-            username TEXT PRIMARY KEY,
-            ik TEXT,
-            fingerprint TEXT
-        );
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS dr_sessions (
-            contact TEXT PRIMARY KEY,
-            state BLOB
-        );
-    """)
-    conn.commit()
-    return conn
+def serialize(val):
+    return base64.standard_b64encode(val).decode('utf-8')
 
-local_db = init_db()
-local_cur = local_db.cursor()
+def deserialize(val):
+    return base64.standard_b64decode(val.encode('utf-8'))
 
-# --- SocketIO client ---
-SIO_SERVER = "http://localhost:6543"
-sio = socketio.Client()
+def GENERATE_DH():
+    sk = x25519.X25519PrivateKey.generate()
+    return sk
 
-# --- DR/Sealed Sender Management ---
-class CryptoManager:
+def DH(dh_pair, dh_pub):
+    dh_out = dh_pair.exchange(dh_pub)
+    return dh_out
+
+def KDF_RK(rk, dh_out):
+    # rk is hkdf salt, dh_out is hkdf input key material
+    if isinstance(rk, x25519.X25519PublicKey):
+        rk_bytes = rk.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
+        )
+    else:
+        rk_bytes = rk
+    info = b"kdf_rk_info"
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=64,
+        salt=rk_bytes,
+        info=info,
+    )
+    h_out = hkdf.derive(dh_out)
+    root_key = h_out[:32]
+    chain_key = h_out[32:]
+    return (root_key, chain_key)
+
+def KDF_CK(ck):
+    if isinstance(ck, x25519.X25519PublicKey):
+        ck_bytes = ck.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
+        )
+    else:
+        ck_bytes = ck
+    h = hmac.HMAC(ck_bytes, hashes.SHA256())
+    h.update(bytearray([0x01]))
+    message_key = h.finalize()
+    h = hmac.HMAC(ck_bytes, hashes.SHA256())
+    h.update(bytearray([0x02]))
+    next_ck = h.finalize()
+    return (next_ck, message_key)
+
+class Header:
+    def __init__(self, dh, pn, n):
+        self.dh = dh
+        self.pn = pn
+        self.n = n
+
+    def serialize(self):
+        return {'dh': serialize(self.dh), 'pn': serialize(self.pn), 'n': serialize(self.n)}
+
+    @staticmethod
+    def deserialize(val):
+        return Header(deserialize(val['dh']), deserialize(val['pn']), deserialize(val['n']))
+
+def HEADER(dh_pair, pn, n):
+    pk = dh_pair.public_key()
+    pk_bytes = pk.public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw
+    )
+    return Header(pk_bytes, pn.to_bytes(pn.bit_length()), n.to_bytes(n.bit_length()))
+
+def CONCAT(ad, header):
+    return (ad, header)
+
+def RatchetEncrypt(state, plaintext, AD):
+    state["CKs"], mk = KDF_CK(state["CKs"])
+    header = HEADER(state["DHs"], state["PN"], state["Ns"])
+    state["Ns"] += 1
+    return header, ENCRYPT_DOUB_RATCH(mk, plaintext, CONCAT(AD, header))
+
+def RatchetDecrypt(state, header, ciphertext, AD):
+    plaintext = TrySkippedMessageKeys(state, header, ciphertext, AD)
+    if plaintext is not None:
+        return plaintext
+    if x25519.X25519PublicKey.from_public_bytes(header.dh) != state["DHr"]:
+        SkipMessageKeys(state, int.from_bytes(header.pn))
+        DHRatchet(state, header)
+    SkipMessageKeys(state, int.from_bytes(header.n))
+    state["CKr"], mk = KDF_CK(state["CKr"])
+    state["Nr"] += 1
+    padded_plain_text = DECRYPT_DOUB_RATCH(mk, ciphertext, CONCAT(AD, header))
+    unpadder = padding.PKCS7(256).unpadder()
+    return unpadder.update(padded_plain_text) + unpadder.finalize()
+
+def TrySkippedMessageKeys(state, header, ciphertext, AD):
+    key = (header.dh, int.from_bytes(header.n))
+    if key in state["MKSKIPPED"]:
+        mk = state["MKSKIPPED"][key]
+        del state["MKSKIPPED"][key]
+        return DECRYPT_DOUB_RATCH(mk, ciphertext, CONCAT(AD, header))
+    else:
+        return None
+
+def SkipMessageKeys(state, until):
+    if state["Nr"] + MAX_SKIP < until:
+        raise Exception("Too many skipped messages")
+    if state["CKr"] is not None:
+        while state["Nr"] < until:
+            state["CKr"], mk = KDF_CK(state["CKr"])
+            DHr_bytes = state["DHr"].public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw
+            )
+            state["MKSKIPPED"][DHr_bytes, state["Nr"]] = mk
+            state["Nr"] += 1
+
+def DHRatchet(state, header):
+    state["PN"] = state["Ns"]
+    state["Ns"] = 0
+    state["Nr"] = 0
+    state["DHr"] = x25519.X25519PublicKey.from_public_bytes(header.dh)
+    state["RK"], state["CKr"] = KDF_RK(state["RK"], DH(state["DHs"], state["DHr"]))
+    state["DHs"] = GENERATE_DH()
+    state["RK"], state["CKs"] = KDF_RK(state["RK"], DH(state["DHs"], state["DHr"]))
+
+def ENCRYPT_DOUB_RATCH(mk, plaintext, associated_data):
+    info = b"encrypt_info_kdf"
+    zero_filled = b"\x00"*80
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=80,
+        salt=zero_filled,
+        info=info,
+    )
+    hkdf_out = hkdf.derive(mk)
+    enc_key = hkdf_out[:32]
+    auth_key = hkdf_out[32:64]
+    iv = hkdf_out[64:]
+    cipher = Cipher(algorithms.AES256(enc_key), modes.CBC(iv))
+    encryptor = cipher.encryptor()
+    padder = padding.PKCS7(256).padder()
+    padded_plaintext = padder.update(plaintext) + padder.finalize()
+    ciphertext = encryptor.update(padded_plaintext) + encryptor.finalize()
+    ad, header = associated_data
+    pk, pn, n = header.dh, header.pn, header.n
+    assoc_data = ad + pk + pn + n
+    padder = padding.PKCS7(256).padder()
+    padded_assoc_data = padder.update(assoc_data) + padder.finalize()
+    h = hmac.HMAC(auth_key, hashes.SHA256())
+    h.update(padded_assoc_data + ciphertext)
+    h_out = h.finalize()
+    return (ciphertext, h_out)
+
+def DECRYPT_DOUB_RATCH(mk, cipherout, associated_data):
+    ciphertext = cipherout[0]
+    mac = cipherout[1]
+    info = b"encrypt_info_kdf"
+    zero_filled = b"\x00"*80
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=80,
+        salt=zero_filled,
+        info=info,
+    )
+    hkdf_out = hkdf.derive(mk)
+    enc_key = hkdf_out[:32]
+    auth_key = hkdf_out[32:64]
+    iv = hkdf_out[64:]
+    cipher = Cipher(algorithms.AES256(enc_key), modes.CBC(iv))
+    decryptor = cipher.decryptor()
+    plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+    h = hmac.HMAC(auth_key, hashes.SHA256())
+    ad, header = associated_data
+    pk, pn, n = header.dh, header.pn, header.n
+    assoc_data = ad + pk + pn + n
+    padder = padding.PKCS7(256).padder()
+    padded_assoc_data = padder.update(assoc_data) + padder.finalize()
+    h.update(padded_assoc_data + ciphertext)
+    try:
+        h.verify(mac)
+    except:
+        raise Exception("MAC verification failed")
+    return plaintext
+
+def ENCRYPT_X3DH(mk, plaintext, associated_data):
+    zero_filled = b"\x00"*80
+    info = b"X3DH"
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=80,
+        salt=zero_filled,
+        info=info,
+    )
+    hkdf_out = hkdf.derive(mk)
+    enc_key = hkdf_out[:32]
+    auth_key = hkdf_out[32:64]
+    iv = hkdf_out[64:]
+    cipher = Cipher(algorithms.AES256(enc_key), modes.CBC(iv))
+    encryptor = cipher.encryptor()
+    padder = padding.PKCS7(256).padder()
+    padded_plaintext = padder.update(plaintext) + padder.finalize()
+    ciphertext = encryptor.update(padded_plaintext) + encryptor.finalize()
+    padder = padding.PKCS7(256).padder()
+    padded_assoc_data = padder.update(associated_data) + padder.finalize()
+    h = hmac.HMAC(auth_key, hashes.SHA256())
+    h.update(padded_assoc_data + ciphertext)
+    h_out = h.finalize()
+    return (ciphertext, h_out)
+
+def DECRYPT_X3DH(mk, ciphertext, mac, associated_data):
+    zero_filled = b"\x00"*80
+    info = b"X3DH"
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=80,
+        salt=zero_filled,
+        info=info,
+    )
+    hkdf_out = hkdf.derive(mk)
+    enc_key = hkdf_out[:32]
+    auth_key = hkdf_out[32:64]
+    iv = hkdf_out[64:]
+    cipher = Cipher(algorithms.AES256(enc_key), modes.CBC(iv))
+    decryptor = cipher.decryptor()
+    plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+    h = hmac.HMAC(auth_key, hashes.SHA256())
+    padder = padding.PKCS7(256).padder()
+    padded_assoc_data = padder.update(associated_data) + padder.finalize()
+    h.update(padded_assoc_data + ciphertext)
+    try:
+        h.verify(mac)
+    except:
+        return (False, "")
+    unpadder = padding.PKCS7(256).unpadder()
+    plaintext =  unpadder.update(plaintext) + unpadder.finalize()
+    return (True, plaintext)
+
+# ================= CLIENT =================
+
+SERVER = 'http://localhost:8080'
+sio = socketio.Client(logger=True)
+sio.connect(SERVER)
+
+class User:
     def __init__(self, username):
         self.username = username
-        self.identity_priv, self.identity_pub = make_keypair()
-        self.sessions = {}  # contact_username -> DRSession
+        self.sessions = {}
+        self.x3dh_session = {}
+        self.ratchet_session = {}
+        self.messages = {}
+        self.generate_user()
 
-    def get_fingerprint(self):
-        pub = self.identity_pub
-        return hashlib.sha256((str(pub[0]) + str(pub[1])).encode()).hexdigest()
+    def init_ratchet_transmission(self, username):
+        self.messages[username] = []
+        SK = self.x3dh_session[username]['sk']
+        self.ratchet_session[username] = {}
+        recipient_dh_pk = self.x3dh_session[username]['spk']
+        self.ratchet_session[username]["DHs"] = GENERATE_DH()
+        self.ratchet_session[username]["DHr"] = recipient_dh_pk
+        self.ratchet_session[username]["RK"], self.ratchet_session[username]["CKs"] = KDF_RK(SK, DH(self.ratchet_session[username]["DHs"], self.ratchet_session[username]["DHr"]))
+        self.ratchet_session[username]["RK"] = x25519.X25519PublicKey.from_public_bytes(self.ratchet_session[username]["RK"])
+        self.ratchet_session[username]["CKs"] = x25519.X25519PublicKey.from_public_bytes(self.ratchet_session[username]["CKs"])
+        self.ratchet_session[username]["CKr"] = None
+        self.ratchet_session[username]["Ns"] = 0
+        self.ratchet_session[username]["Nr"] = 0
+        self.ratchet_session[username]["PN"] = 0
+        self.ratchet_session[username]["MKSKIPPED"] = {}
 
-    def save_session(self, contact):
-        session = self.sessions[contact]
-        state_bytes = pickle.dumps(session.serialize())
-        local_cur.execute("PRAGMA key = '{}';".format(DB_PASSWORD))
-        local_cur.execute(
-            "INSERT OR REPLACE INTO dr_sessions (contact, state) VALUES (?, ?)",
-            (contact, state_bytes)
-        )
-        local_db.commit()
+    def init_ratchet_reciever(self, username):
+        self.messages[username] = []
+        SK = self.x3dh_session[username]['sk']
+        recipient_dh_sk = self.x3dh_session[username]['spk']
+        self.ratchet_session[username] = {}
+        self.ratchet_session[username]["DHs"] = recipient_dh_sk
+        self.ratchet_session[username]["DHr"] = None
+        self.ratchet_session[username]["RK"] = SK
+        self.ratchet_session[username]["CKs"] = None
+        self.ratchet_session[username]["CKr"] = None
+        self.ratchet_session[username]["Ns"] = 0
+        self.ratchet_session[username]["Nr"] = 0
+        self.ratchet_session[username]["PN"] = 0
+        self.ratchet_session[username]["MKSKIPPED"] = {}
 
-    def load_session(self, contact):
-        local_cur.execute("PRAGMA key = '{}';".format(DB_PASSWORD))
-        local_cur.execute("SELECT state FROM dr_sessions WHERE contact=?", (contact,))
-        row = local_cur.fetchone()
-        if row:
-            session = DRSession.deserialize(pickle.loads(row[0]))
-            self.sessions[contact] = session
-            return session
-        return None
+    def generate_user(self, opk_size=10):
+        self.ik = x25519.X25519PrivateKey.generate()
+        self.sik = ed25519.Ed25519PrivateKey.generate()
+        self.spk = x25519.X25519PrivateKey.generate()
+        spk_bytes = self.spk.public_key().public_bytes_raw()
+        self.spk_sig = self.sik.sign(spk_bytes)
 
-    def ensure_session(self, contact, prekey_bundle=None):
-        if contact in self.sessions:
-            return self.sessions[contact]
-        session = self.load_session(contact)
-        if session:
-            return session
-        if prekey_bundle:
-            return self.start_session(contact, prekey_bundle)
-        return None
+    def serialize_user(self):
+        ik_bytes = self.ik.public_key().public_bytes_raw()
+        sik_bytes = self.sik.public_key().public_bytes_raw()
+        spk_bytes = self.spk.public_key().public_bytes_raw()
+        return {
+            "username": self.username,
+            "ik": serialize(ik_bytes),
+            "sik": serialize(sik_bytes),
+            "spk": serialize(spk_bytes),
+            "spk_sig": serialize(self.spk_sig)
+        }
 
-    def start_session(self, contact, prekey_bundle):
-        # --- FULL REAL X3DH, NO SIMULATION ---
-        # Parse peer keys from prekey_bundle, all in hex
-        IK_B = DHPublicKey.from_bytes(bytes.fromhex(prekey_bundle["ik"]))
-        SPK_B = DHPublicKey.from_bytes(bytes.fromhex(prekey_bundle["spk"]))
-        OPK_B = DHPublicKey.from_bytes(bytes.fromhex(prekey_bundle["opk"]))
+    def register_user(self):
+        user = self.serialize_user()
+        return sio.call("register_user", user)
 
-        # Our own keys
-        IK_A_priv, IK_A_pub = self.identity_priv, self.identity_pub
-        EK_A = DHKeyPair.generate_dh()  # Ephemeral key
+    def request_user_prekey_bundle(self, username):
+        res = sio.call("request_prekey", {"username": username})
+        if not res[0]:
+            raise Exception(f"User {username} not registered")
+        data = res[1]
+        ik_bytes = deserialize(data["ik"])
+        sik_bytes = deserialize(data["sik"])
+        spk_bytes = deserialize(data["spk"])
+        spk_sig_bytes = deserialize(data["spk_sign"])
+        ik = x25519.X25519PublicKey.from_public_bytes(ik_bytes)
+        sik = ed25519.Ed25519PublicKey.from_public_bytes(sik_bytes)
+        spk = x25519.X25519PublicKey.from_public_bytes(spk_bytes)
+        try:
+            sik.verify(spk_sig_bytes, spk_bytes)
+        except:
+            raise Exception("SPK verification failed")
+        self.sessions[username] = {
+            'ik': ik,
+            'spk': spk
+        }
 
-        # Peer keys as DHPublicKey (already done above)
-        # All ECDH using msgdr types
-        dh1 = IK_A_priv.dh_out(SPK_B)    # ECDH(IK_A, SPK_B)
-        dh2 = EK_A.private_key.dh_out(IK_B)    # ECDH(EK_A, IK_B)
-        dh3 = EK_A.private_key.dh_out(SPK_B)   # ECDH(EK_A, SPK_B)
-        dh4 = EK_A.private_key.dh_out(OPK_B)   # ECDH(EK_A, OPK_B)
+    def send_message(self, username, msg):
+        ad = self.x3dh_session[username]['ad']
+        header, ciphertext = RatchetEncrypt(self.ratchet_session[username], msg.encode('utf-8'), ad.encode('utf-8'))
+        ciphertext, mac = ciphertext
+        self.messages[username].append((self.username, msg))
+        return sio.call("ratchet_msg", {'username': username, 'cipher': serialize(ciphertext), 'header': header.serialize(), 'hmac': serialize(mac), 'from': self.username})
 
-        # Real HKDF
-        from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-        from cryptography.hazmat.primitives import hashes
-        from cryptography.hazmat.backends import default_backend
+    def is_connected(self, username):
+        return username in self.x3dh_session
 
-        x3dh_input = dh1 + dh2 + dh3 + dh4
-        hkdf_out = HKDF(
+    def recieve_message(self, username, msg):
+        header = Header.deserialize(msg['header'])
+        ciphertext = deserialize(msg['cipher'])
+        hmac_val = deserialize(msg['hmac'])
+        ad = self.x3dh_session[username]['ad']
+        plaintext = RatchetDecrypt(self.ratchet_session[username], header, (ciphertext, hmac_val), ad.encode('utf-8'))
+        self.messages[username].append((username, plaintext.decode('utf-8')))
+        return plaintext.decode('utf-8')
+
+    def receive_x3dh(self, username, data):
+        ika_bytes = deserialize(data["ik"])
+        epk_bytes = deserialize(data["epk"])
+        cipher = deserialize(data["cipher"])
+        hmac_val = deserialize(data["hmac"])
+        ika = x25519.X25519PublicKey.from_public_bytes(ika_bytes)
+        epk = x25519.X25519PublicKey.from_public_bytes(epk_bytes)
+        dh1 = self.spk.exchange(ika)
+        dh2 = self.ik.exchange(epk)
+        dh3 = self.spk.exchange(epk)
+        info = b"extended_triple_diffie_hellman"
+        hkdf = HKDF(
             algorithm=hashes.SHA256(),
             length=32,
-            salt=None,
-            info=b"X3DH",
-            backend=default_backend()
-        ).derive(x3dh_input)
-
-        # Setup DRSession as sender
-        session = DRSession()
-        session.setup_sender(hkdf_out, SPK_B)
-        self.sessions[contact] = session
-        self.save_session(contact)
-        return session
-
-    def encrypt_message(self, contact, plaintext):
-        session = self.sessions[contact]
-        ad = self.username.encode()
-        msg = session.encrypt_message(plaintext, ad)
-        # Sealed sender cert
-        timestamp = int(time.time())
-        ephemeral_priv, ephemeral_pub = make_keypair()
-        cert = {
-            "sender": self.username,
-            "timestamp": timestamp,
-            "ephemeral_key": hex(ephemeral_pub[0]),
-        }
-        cert_bytes = json.dumps(cert).encode()
-        signature = sign_message(self.identity_priv, cert_bytes)
-        cert["signature"] = "0x{:x},0x{:x}".format(*signature)
-        payload = {
-            "ciphertext": base64.b64encode(msg.ct).decode(),
-            "header": base64.b64encode(bytes(msg.header)).decode(),
-            "sender_cert": cert
-        }
-        self.save_session(contact)
-        return base64.b64encode(json.dumps(payload).encode()).decode()
-
-    def decrypt_message(self, contact, sealed_payload_b64):
-        try:
-            session = self.ensure_session(contact)
-            payload = json.loads(base64.b64decode(sealed_payload_b64))
-            ciphertext = base64.b64decode(payload["ciphertext"])
-            header = base64.b64decode(payload["header"])
-            sender_cert = payload["sender_cert"]
-            # ECDSA verify
-            cert_bytes = json.dumps({k: v for k, v in sender_cert.items() if k != "signature"}).encode()
-            r, s = [int(x, 16) for x in sender_cert["signature"].split(",")]
-            # Get sender pubkey from contacts
-            local_cur.execute("PRAGMA key = '{}';".format(DB_PASSWORD))
-            local_cur.execute("SELECT ik FROM contacts WHERE username=?", (sender_cert["sender"],))
-            row = local_cur.fetchone()
-            if not row:
-                return "[Unknown sender]", None
-            pubkey_bytes = bytes.fromhex(row[0])
-            pubkey_x = int.from_bytes(pubkey_bytes[:32], "big")
-            pubkey_y = int.from_bytes(pubkey_bytes[32:64], "big")
-            pub = (pubkey_x, pubkey_y)
-            assert verify_signature(pub, cert_bytes, (r, s)) == "signature matches"
-            # DR decrypt
-            from msgdr import Header, Message
-            msg = Message(Header.from_bytes(header), ciphertext)
-            ad = contact.encode()
-            plaintext = session.decrypt_message(msg, ad)
-            self.save_session(contact)
-            return plaintext, sender_cert["sender"]
-        except Exception as e:
-            return f"[decryption failed: {e}]", None
-
-crypto_manager = None  # late init
-
-# --- Advanced PySide6 UI ---
-class ChatMainWindow(QMainWindow):
-    def __init__(self, username):
-        super().__init__()
-        self.setWindowTitle("Sophisticated Secure Messenger")
-        self.setGeometry(100, 100, 1024, 720)
-        self.username = username
-        self.crypto_manager = crypto_manager
-        self.contacts = self.load_contacts()
-        self.stacked = QStackedWidget()
-        self.setCentralWidget(self.stacked)
-        self.contact_list = ContactListWidget(self)
-        self.chat_area = ChatAreaWidget(self)
-        self.fingerprint_area = FingerprintWidget(self)
-        self.stacked.addWidget(self.contact_list)
-        self.stacked.addWidget(self.chat_area)
-        self.stacked.addWidget(self.fingerprint_area)
-        self.show_contacts()
-
-    def load_contacts(self):
-        local_cur.execute("PRAGMA key = '{}';".format(DB_PASSWORD))
-        local_cur.execute("SELECT username, ik, fingerprint FROM contacts")
-        return {row[0]: {"ik": row[1], "fingerprint": row[2]} for row in local_cur.fetchall()}
-
-    def show_contacts(self):
-        self.stacked.setCurrentWidget(self.contact_list)
-        self.contact_list.refresh()
-
-    def open_chat(self, contact):
-        self.chat_area.set_contact(contact)
-        self.stacked.setCurrentWidget(self.chat_area)
-
-    def show_fingerprint(self, fingerprint, username):
-        self.fingerprint_area.set_fingerprint(fingerprint, username)
-        self.stacked.setCurrentWidget(self.fingerprint_area)
-
-class ContactListWidget(QWidget):
-    def __init__(self, mw):
-        super().__init__()
-        self.mw = mw
-        vbox = QVBoxLayout(self)
-        self.label = QLabel("<h2>Your Contacts</h2>")
-        self.list = QListWidget()
-        self.add_btn = QPushButton("Add Contact")
-        self.add_btn.clicked.connect(self.add_contact)
-        vbox.addWidget(self.label)
-        vbox.addWidget(self.list)
-        vbox.addWidget(self.add_btn)
-        self.list.itemDoubleClicked.connect(self.open_chat)
-        self.list.setSelectionMode(QListWidget.SingleSelection)
-        self.setLayout(vbox)
-
-    def refresh(self):
-        self.list.clear()
-        for contact in self.mw.contacts:
-            item = QListWidgetItem(f"{contact} ({self.mw.contacts[contact]['fingerprint'][:12]}...)")
-            self.list.addItem(item)
-
-    def open_chat(self, item):
-        contact = item.text().split()[0]
-        self.mw.open_chat(contact)
-
-    def add_contact(self):
-        username, ok = QInputDialog.getText(self, "Add Contact", "Username:")
-        if ok and username:
-            # Fetch prekey from server
-            def _cb(resp):
-                self._handle_prekey(resp, username)
-            sio.emit("request_prekey", {"username": username}, callback=_cb)
-
-    def _handle_prekey(self, resp, username):
-        success, bundle = resp
-        if success:
-            ik = bundle["ik"]
-            fingerprint = hashlib.sha256(bytes.fromhex(ik)).hexdigest()
-            local_cur.execute("PRAGMA key = '{}';".format(DB_PASSWORD))
-            local_cur.execute("INSERT OR IGNORE INTO contacts (username, ik, fingerprint) VALUES (?, ?, ?)",
-                              (username, ik, fingerprint))
-            local_db.commit()
-            self.mw.contacts[username] = {"ik": ik, "fingerprint": fingerprint}
-            # Real session setup
-            self.mw.crypto_manager.ensure_session(username, bundle)
-            self.refresh()
+            salt=b"\x00"*32,
+            info=info,
+        )
+        f = b"\xff" * 32
+        km = dh1 + dh2 + dh3
+        SK = hkdf.derive(f + km)
+        ad = serialize(ika_bytes) + serialize(self.ik.public_key().public_bytes_raw())
+        res = DECRYPT_X3DH(SK, cipher, hmac_val, ad.encode('utf-8'))
+        if res[0]:
+            self.x3dh_session[username] = {"sk": SK, "spk": self.spk, "ad": ad}
+            self.init_ratchet_reciever(username)
         else:
-            QMessageBox.critical(self, "Error", f"User {username} not found.")
+            print("DH Failed")
+            return False
+        return True
 
-class ChatAreaWidget(QWidget):
-    def __init__(self, mw):
+    def perform_x3dh(self, username):
+        if username not in self.sessions:
+            print("User key bundles not requested!")
+        self.epk = x25519.X25519PrivateKey.generate()
+        dh1 = self.ik.exchange(self.sessions[username]['spk'])
+        dh2 = self.epk.exchange(self.sessions[username]['ik'])
+        dh3 = self.epk.exchange(self.sessions[username]['spk'])
+        info = b"extended_triple_diffie_hellman"
+        hkdf = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=b"\x00"*32,
+            info=info,
+        )
+        f = b"\xff" * 32
+        km = dh1 + dh2 + dh3
+        SK = hkdf.derive(f + km)
+        self.epk_pub = self.epk.public_key()
+        epk_pub_bytes = self.epk_pub.public_bytes_raw()
+        ik_bytes = self.ik.public_key().public_bytes_raw()
+        ik_b_bytes = self.sessions[username]['ik'].public_bytes_raw()
+        del self.epk
+        del dh1, dh2, dh3
+        ad = serialize(ik_bytes) + serialize(ik_b_bytes)
+        msg = "##CHAT_START##"
+        ciphertext, hmac_val = ENCRYPT_X3DH(SK, msg.encode('utf-8'), ad.encode('utf-8'))
+        self.x3dh_session[username] = {"sk": SK, "spk": self.sessions[username]['spk'], "ad": ad}
+        res = sio.call("x3dh_message", {"username": username, "from": self.username, "ik": serialize(ik_bytes), "epk": serialize(epk_pub_bytes), "cipher": serialize(ciphertext), "hmac": serialize(hmac_val)})
+        if res:
+            self.init_ratchet_transmission(username)
+        else:
+            print("DH Failed!")
+        return res
+
+def reg_callback(user, msg_event=lambda x: x):
+    @sio.on('x3dh_message')
+    def on_x3dh_message(data):
+        user.receive_x3dh(data["from"], data)
+        return True
+
+    @sio.on('ratchet_msg')
+    def on_ratchet_msg(data):
+        msg_event(user.recieve_message(data["from"], data))
+        return True
+
+# ================= GUI =================
+
+username = None
+user = User(None)
+target_user = None
+
+class SocketIOClient(QObject):
+    message_received = Signal(str)
+    def __init__(self):
         super().__init__()
-        self.mw = mw
-        self.contact = None
-        self.layout = QVBoxLayout(self)
-        self.title = QLabel()
-        self.history = QTextEdit()
-        self.history.setReadOnly(True)
-        self.input = QLineEdit()
-        self.send_btn = QPushButton("Send")
-        self.send_btn.clicked.connect(self.send_msg)
-        self.fingerprint_btn = QPushButton("Show Fingerprint")
-        self.fingerprint_btn.clicked.connect(self.show_fingerprint)
-        hbox = QHBoxLayout()
-        hbox.addWidget(self.input)
-        hbox.addWidget(self.send_btn)
-        self.layout.addWidget(self.title)
-        self.layout.addWidget(self.history)
-        self.layout.addLayout(hbox)
-        self.layout.addWidget(self.fingerprint_btn)
-        self.setLayout(self.layout)
-        self.poller = QTimer(self)
-        self.poller.timeout.connect(self.poll_new_msgs)
-        self.poller.start(2500)
+    def run(self):
+        def on_message(data):
+            self.message_received.emit(data)
+        reg_callback(user, on_message)
+        sio.wait()
 
-    def set_contact(self, contact):
-        self.contact = contact
-        self.title.setText(f"<h2>Chat with {contact}</h2>")
-        session = self.mw.crypto_manager.ensure_session(contact)
-        self.load_history()
-
-    def load_history(self):
-        local_cur.execute("PRAGMA key = '{}';".format(DB_PASSWORD))
-        local_cur.execute("SELECT sender, payload, timestamp FROM messages WHERE chat_id=? ORDER BY timestamp ASC",
-                          (self.chat_id(),))
-        msgs = local_cur.fetchall()
-        self.history.clear()
-        for sender, payload, ts in msgs:
-            plaintext, _ = self.decrypt_payload(payload)
-            color = "blue" if sender == self.mw.username else "green"
-            self.history.append(f"<b><font color='{color}'>{sender}</font></b>: {plaintext} <small><i>{ts}</i></small>")
-
-    def send_msg(self):
-        msg = self.input.text()
-        if msg and self.contact:
-            payload = self.mw.crypto_manager.encrypt_message(self.contact, msg)
-            sealed_msg = {
-                "recipient_id": self.contact,
-                "sealed_sender": True,
-                "payload": payload
-            }
-            sio.emit("send_sealed", sealed_msg)
-            local_cur.execute("PRAGMA key = '{}';".format(DB_PASSWORD))
-            local_cur.execute(
-                "INSERT INTO messages (chat_id, sender, recipient, payload, sealed) VALUES (?, ?, ?, ?, 1)",
-                (self.chat_id(), self.mw.username, self.contact, payload)
-            )
-            local_db.commit()
-            self.input.clear()
-            self.load_history()
-
-    def poll_new_msgs(self):
-        if not self.contact:
-            return
-        sio.emit("fetch_msgs", {"username": self.mw.username}, callback=self.on_new_msgs)
-
-    def on_new_msgs(self, msg_list):
-        for payload in msg_list:
-            local_cur.execute("PRAGMA key = '{}';".format(DB_PASSWORD))
-            local_cur.execute(
-                "INSERT INTO messages (chat_id, sender, recipient, payload, sealed) VALUES (?, ?, ?, ?, 1)",
-                (self.chat_id(), self.contact, self.mw.username, payload)
-            )
-            local_db.commit()
-        self.load_history()
-
-    def decrypt_payload(self, payload):
-        plaintext, sender = self.mw.crypto_manager.decrypt_message(self.contact, payload)
-        return plaintext or "[decryption failed]", sender
-
-    def chat_id(self):
-        return f"{min(self.mw.username, self.contact)}-{max(self.mw.username, self.contact)}"
-
-    def show_fingerprint(self):
-        fp = self.mw.contacts[self.contact]["fingerprint"]
-        self.mw.show_fingerprint(fp, self.contact)
-
-class FingerprintWidget(QWidget):
-    def __init__(self, mw):
+class Worker(QThread):
+    def __init__(self):
         super().__init__()
-        self.mw = mw
-        vbox = QVBoxLayout(self)
-        self.label = QLabel()
-        self.back_btn = QPushButton("Back")
-        self.back_btn.clicked.connect(self.back)
-        vbox.addWidget(self.label)
-        vbox.addWidget(self.back_btn)
-        self.setLayout(vbox)
+    def run(self):
+        self.client = SocketIOClient()
+        self.client.message_received.connect(self.on_message_received)
+        self.client.run()
+    def on_message_received(self, message):
+        global mw, target_user
+        if target_user is not None:
+            mw.update_chat(user.messages[target_user])
 
-    def set_fingerprint(self, fingerprint, username):
-        self.label.setText(f"<h4>Fingerprint for {username}</h4><code>{fingerprint}</code>")
+app = QApplication(sys.argv)
 
-    def back(self):
-        self.mw.show_contacts()
-
-class LoginWidget(QWidget):
-    def __init__(self, mw):
-        super().__init__()
-        self.mw = mw
-        vbox = QVBoxLayout(self)
+class LoginScreen(QWidget):
+    def __init__(self, parent=None):
+        super(LoginScreen, self).__init__(parent)
+        self.setWindowTitle("Login")
+        self.username_label = QLabel("Username:")
         self.username_edit = QLineEdit()
-        self.username_edit.setPlaceholderText("Enter your username")
-        self.login_btn = QPushButton("Login")
-        self.login_btn.clicked.connect(self.login)
-        vbox.addWidget(QLabel("<h2>Login</h2>"))
-        vbox.addWidget(self.username_edit)
-        vbox.addWidget(self.login_btn)
-        self.setLayout(vbox)
-
-    def login(self):
+        self.login_button = QPushButton("Login")
+        self.login_button.clicked.connect(self.handle_login)
+        layout = QVBoxLayout()
+        layout.addWidget(self.username_label)
+        layout.addWidget(self.username_edit)
+        layout.addWidget(self.login_button)
+        self.setLayout(layout)
+    def handle_login(self):
+        global username, user
         username = self.username_edit.text()
-        if username:
-            priv, pub = make_keypair()
-            ik_bytes = pub[0].to_bytes(32, "big") + pub[1].to_bytes(32, "big")
-            ik_hex = ik_bytes.hex()
-            sio.emit("register_user", {
-                "username": username,
-                "ik": ik_hex,
-                "sik": "0"*64, "spk": "0"*112, "opk": "0"*112, "spk_sig": "0"*64
-            })
-            local_cur.execute("PRAGMA key = '{}';".format(DB_PASSWORD))
-            fingerprint = hashlib.sha256(ik_bytes).hexdigest()
-            local_cur.execute("INSERT OR IGNORE INTO contacts (username, ik, fingerprint) VALUES (?, ?, ?)",
-                              (username, ik_hex, fingerprint))
-            local_db.commit()
-            global crypto_manager
-            crypto_manager = CryptoManager(username)
-            mainw = ChatMainWindow(username)
-            mainw.crypto_manager = crypto_manager
-            mainw.show()
-            mw.close()
+        user.username = username
+        if user.register_user():
+            self.parent().switch_to_select_screen()
 
-# --- SocketIO receive handlers ---
-@sio.on("receive_sealed_message")
-def on_receive_sealed(data):
-    recipient = data["recipient_id"]
-    payload = data["payload"]
-    local_cur.execute("PRAGMA key = '{}';".format(DB_PASSWORD))
-    local_cur.execute("INSERT INTO messages (chat_id, sender, recipient, payload, sealed) VALUES (?, ?, ?, ?, 1)",
-                      (f"{min(recipient, crypto_manager.username)}-{max(recipient, crypto_manager.username)}",
-                       recipient, crypto_manager.username, payload))
-    local_db.commit()
+class SelectScreen(QWidget):
+    def __init__(self, parent=None):
+        super(SelectScreen, self).__init__(parent)
+        self.setWindowTitle("Select")
+        self.main_layout = QVBoxLayout()
+        self.main_layout.addWidget(QLabel(f"Hi {username}!"))
+        self.main_layout.addWidget(QLabel("<h2>Connect to:</h2>"))
+        self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.clicked.connect(self.refresh)
+        self.main_layout.addWidget(self.refresh_button)
+        self.user_layout = QVBoxLayout()
+        self.main_layout.addLayout(self.user_layout)
+        self.refresh()
+        self.setLayout(self.main_layout)
+    def refresh(self):
+        for i in reversed(range(self.user_layout.count())):
+            widget = self.user_layout.itemAt(i).widget()
+            if widget is not None:
+                widget.deleteLater()
+        users = sio.call('request_users')
+        for u in users:
+            if u != username:
+                button = QPushButton(u)
+                button.clicked.connect(lambda _, name=u: self.user_clicked(name))
+                self.user_layout.addWidget(button)
+    def user_clicked(self, name):
+        global target_user
+        target_user = name
+        if not user.is_connected(target_user):
+            user.request_user_prekey_bundle(target_user)
+            user.perform_x3dh(target_user)
+        self.parent().switch_to_chat_screen()
 
-# --- Main Application ---
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    mw = QMainWindow()
-    login = LoginWidget(mw)
-    mw.setCentralWidget(login)
-    mw.setWindowTitle("Secure Messenger")
-    mw.setGeometry(200, 200, 400, 200)
-    mw.show()
-    sio.connect(SIO_SERVER)
-    sys.exit(app.exec())
+class ChatScreen(QWidget):
+    def __init__(self, parent=None):
+        super(ChatScreen, self).__init__(parent)
+        self.setWindowTitle("Chat")
+        xlayout = QVBoxLayout()
+        chat_layout = QHBoxLayout()
+        back_button = QPushButton("Back")
+        back_button.clicked.connect(self.back_message)
+        toolbar_layout = QHBoxLayout()
+        xlayout.addLayout(toolbar_layout)
+        toolbar_layout.addWidget(back_button)
+        toolbar_layout.addWidget(QLabel(f"{username} -> {target_user}"))
+        self.chat_history = QTextEdit()
+        self.chat_history.setReadOnly(True)
+        xlayout.addWidget(self.chat_history)
+        self.input_field = QLineEdit()
+        send_button = QPushButton("Send")
+        send_button.clicked.connect(self.send_message)
+        chat_layout.addWidget(self.input_field)
+        chat_layout.addWidget(send_button)
+        xlayout.addLayout(chat_layout)
+        self.setLayout(xlayout)
+        self.update_messages(user.messages[target_user])
+    def send_message(self):
+        message = self.input_field.text()
+        if message:
+            self.input_field.clear()
+            user.send_message(target_user, message)
+            self.update_messages(user.messages[target_user])
+    def update_messages(self, messages):
+        self.chat_history.clear()
+        for sender, msg in messages:
+            color = "green" if sender == username else "red"
+            self.append_colored_text(sender, msg, color)
+    def back_message(self):
+        self.parent().switch_to_select_screen()
+    def append_colored_text(self, sender, msg, color):
+        self.chat_history.append(f"<font color='{color}'> <strong>{sender}:</strong> {msg}</font><br>")
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super(MainWindow, self).__init__()
+        self.login_screen = LoginScreen(self)
+        self.setCentralWidget(self.login_screen)
+    def switch_to_chat_screen(self):
+        self.chat_screen = ChatScreen(self)
+        self.setCentralWidget(self.chat_screen)
+    def switch_to_select_screen(self):
+        self.select_screen = SelectScreen(self)
+        self.setCentralWidget(self.select_screen)
+    def update_chat(self, messages):
+        self.chat_screen.update_messages(messages)
+
+mw = MainWindow()
+mw.show()
+worker_thread = Worker()
+worker_thread.start()
+sys.exit(app.exec())
